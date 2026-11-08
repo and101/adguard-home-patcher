@@ -1,0 +1,9 @@
+dist/
+agh/
+node_modules/
+__pycache__/
+*.pyc
+ui/
+.env
+.env.*
+!.env.example

@@ -1,0 +1,35 @@
+{
+  "services": {
+    "adguardhome": {
+      "entrypoint": [
+        "/bin/sh",
+        "/opt/adguardhome-patcher/agh-launch.sh"
+      ],
+      "environment": {
+        "AGH_BIN": "/opt/adguardhome/AdGuardHome",
+        "AGH_UI_ROOT": "/opt/adguardhome/ui"
+      },
+      "volumes": [
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "read_only": true,
+          "source": "/usr/local/lib/adguardhome-patcher/agh-launch.sh",
+          "target": "/opt/adguardhome-patcher/agh-launch.sh",
+          "type": "bind"
+        },
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "read_only": true,
+          "source": "/opt/adguardhome-patcher/ui",
+          "target": "/opt/adguardhome/ui",
+          "type": "bind"
+        }
+      ],
+      "working_dir": "/opt/adguardhome/ui"
+    }
+  }
+}

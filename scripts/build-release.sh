@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# build-release.sh applies the dashboard patch to an AdGuard Home release, runs
+# the compatibility gate and packages the patched UI.
+#
+# Usage: scripts/build-release.sh <tag> [out-dir]
+#
+# On success, out-dir (default: dist) contains:
+#   agh-patcher-tools.tar.gz           released installer and manual CLI
+#   agh-patcher-tools.tar.gz.sha256
+#   agh-dashboard-range.tar.gz         frontend, version and revision manifest
+#   agh-dashboard-range.tar.gz.sha256
+#   agh-dashboard-range-source.tar.gz  patched source and build/install scripts
+#   agh-dashboard-range-source.tar.gz.sha256
+# On failure, it exits non-zero and writes the reason to out-dir/REASON.
+#
+# Gate: the stats API still documents "recent", the patch applies (three-way
+# against PATCH_BASE), applied-source whitespace, typecheck, eslint, unit tests,
+# production build, and a real-DNS/Query Log integration test using the official
+# release binary with the patched UI. Set SMOKE_TEST=0 to skip binary checks.
+#
+# The UI manifest's patch_revision is the SHA-256 artefact revision of the built
+# build/static files.  Webpack's CSS names include a compilation hash that
+# depends on the absolute source path, so the frontend is always built at one
+# fixed path: equivalent builds then produce identical bytes and revisions.
+
+set -euo pipefail
+
+tag=${1:?usage: build-release.sh <tag> [out-dir]}
+[[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9]+([.-][A-Za-z0-9]+)*)?$ ]] \
+	|| { echo "invalid AdGuard Home release tag: $tag" >&2; exit 1; }
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+out=$(mkdir -p "${2:-dist}" && cd "${2:-dist}" && pwd)
+patch_file="$repo_root/patch/dashboard-range.patch"
+patch_base=$(cat "$repo_root/patch/PATCH_BASE")
+REPO_URL=${REPO_URL:-https://github.com/AdguardTeam/AdGuardHome.git}
+SMOKE_TEST=${SMOKE_TEST:-1}
+BROWSER_TEST=${BROWSER_TEST:-0}
+
+SUDO=
+if [ "$(id -u)" != 0 ]; then
+	SUDO=sudo
+fi
+
+work=$(mktemp -d)
+trap '$SUDO rm -rf "$work"' EXIT
+src=/tmp/adguardhome-patcher-frontend-build
+
+log() { printf '::notice::%s\n' "$*" >&2; }
+
+fail() {
+	echo "$1" >"$out/REASON"
+	printf '::error::%s: %s\n' "$tag" "$1" >&2
+	exit 1
+}
+
+step() {
+	local name=$1
+	shift
+	echo "::group::$name" >&2
+	if ! "$@" >&2; then
+		echo "::endgroup::" >&2
+		fail "$name failed"
+	fi
+	echo "::endgroup::" >&2
+}
+
+host_arch() {
+	case "$(uname -m)" in
+	x86_64 | amd64) echo amd64 ;;
+	aarch64 | arm64) echo arm64 ;;
+	*) return 1 ;;
+	esac
+}
+
+# Reuse one official download/instance for frontend smoke, genuine DNS traffic,
+# real Query Log pagination, and the production catch-up helper/UI integration.
+smoke_test() {
+	local dir="$work/smoke" arch
+	arch=$(host_arch) || { echo "unsupported architecture for official-binary integration"; return 1; }
+	mkdir -p "$dir"
+	curl -fsSL --connect-timeout 10 --max-time 60 -o "$dir/agh.tgz" \
+		"https://github.com/AdguardTeam/AdGuardHome/releases/download/$tag/AdGuardHome_linux_$arch.tar.gz"
+	tar xzf "$dir/agh.tgz" -C "$dir"
+	node "$repo_root/scripts/tests/querylog-real-api.cjs" "$src" "$dir/AdGuardHome/AdGuardHome" "$tag"
+}
+
+rm -f "$out/REASON" "$out"/agh-dashboard-range.tar.gz* "$out"/agh-dashboard-range-source.tar.gz* "$out"/agh-patcher-tools.tar.gz*
+
+# Never reuse or delete a directory this run did not create.
+mkdir "$src" 2>/dev/null \
+	|| fail "fixed frontend build path $src already exists; remove it after any other build finishes"
+trap '$SUDO rm -rf "$work" "$src"' EXIT
+
+step "validation regression tests" python3 "$repo_root/scripts/tests/test-validation.py"
+step "manual patcher install/update/uninstall tests" python3 "$repo_root/scripts/tests/test-patcher.py"
+
+log "building $tag with patch made against $patch_base"
+git clone -q --depth 1 --branch "$tag" "$REPO_URL" "$src" || fail "couldn't fetch the $tag source"
+
+grep -q "'name': 'recent'" "$src/openapi/openapi.yaml" \
+	|| fail "the stats API no longer documents the 'recent' parameter"
+
+grep -q "'/querylog':" "$src/openapi/openapi.yaml" \
+	|| fail "the release no longer documents the Query Log API"
+
+# The base release lets git do a three-way merge when surrounding code moved.
+git -C "$src" fetch -q --depth 1 origin tag "$patch_base" || true
+git -C "$src" apply --3way --whitespace=nowarn "$patch_file" >&2 \
+	|| fail "the patch doesn't apply cleanly"
+if git -C "$src" diff --name-only --diff-filter=U | grep -q .; then
+	fail "the patch has merge conflicts"
+fi
+
+# --3way stages the applied patch; checking only the working diff misses it.
+step "applied-source whitespace" "$repo_root/scripts/check-applied-whitespace.sh" "$src"
+
+mapfile -t ts_files < <(grep '^+++ b/client/' "$patch_file" | sed 's#^+++ b/client/##' | grep -E '\.tsx?$')
+
+cd "$src/client"
+step "npm ci" npm ci --no-audit --no-fund
+step "typecheck" npm run typecheck
+step "lint" npx eslint --ext .ts,.tsx "${ts_files[@]}"
+step "unit tests" npx vitest --run
+step "production build" sh "$repo_root/scripts/frontend-build.sh"
+[ -f "$src/build/static/index.html" ] || fail "build produced no index.html"
+
+if [ "$BROWSER_TEST" = 1 ]; then
+	if [ -z "${PLAYWRIGHT_CHROMIUM_EXECUTABLE:-}" ]; then
+		step "install Chromium for browser checks" npx playwright install --with-deps chromium --only-shell
+	fi
+	step "Live Query Log browser checks" node "$repo_root/scripts/tests/live-query-log-browser.cjs" "$src"
+fi
+
+if [ "$SMOKE_TEST" = 1 ]; then
+	step "smoke test against the official $tag binary" smoke_test
+fi
+
+echo "$tag" >"$src/build/VERSION"
+cp "$src/LICENSE.txt" "$src/build/LICENSE.txt"
+printf 'Modified AdGuard Home dashboard by adguard-home-patcher.\nUpstream: %s\nBuilt: %s\nSource: agh-dashboard-range-source.tar.gz in the same release.\n' \
+	"$tag" "$(date -u +%F)" >"$src/build/NOTICE"
+frontend_revision=$(python3 "$repo_root/scripts/release-manifest.py" "$tag" "$src/build") \
+	|| fail "couldn't record the frontend artefact revision"
+log "frontend artefact revision: $frontend_revision"
+tar czf "$out/agh-dashboard-range.tar.gz" -C "$src" build/static build/VERSION build/LICENSE.txt build/NOTICE build/MANIFEST.json
+(cd "$out" && sha256sum agh-dashboard-range.tar.gz >agh-dashboard-range.tar.gz.sha256)
+step "package released installer tools" python3 "$repo_root/scripts/release-manifest.py" --tools "$tag" "$out"
+mkdir -p "$src/patcher"
+cp -r "$repo_root/patch" "$repo_root/scripts" "$repo_root/install" "$src/patcher/"
+cp "$repo_root/LICENSE" "$repo_root/README.md" "$src/patcher/"
+mkdir -p "$src/patcher/docs"
+cp "$repo_root"/docs/*.md "$src/patcher/docs/"
+mkdir -p "$src/patcher/.github/workflows"
+cp "$repo_root/.github/workflows/build.yml" "$src/patcher/.github/workflows/"
+tar czf "$out/agh-dashboard-range-source.tar.gz" \
+	--exclude='./.git' --exclude='./client/node_modules' --exclude='./build' \
+	--exclude='*/__pycache__' --exclude='*.pyc' -C "$src" .
+(cd "$out" && sha256sum agh-dashboard-range-source.tar.gz >agh-dashboard-range-source.tar.gz.sha256)
+step "release manifest and packaged management tooling" python3 "$repo_root/scripts/release-manifest.py" --verify "$tag" "$out"
+log "$tag passed the compatibility gate"
