@@ -108,10 +108,10 @@ index 0000000..3768ece
 +});
 diff --git a/client/src/__tests__/liveQueryLog.test.ts b/client/src/__tests__/liveQueryLog.test.ts
 new file mode 100644
-index 0000000..b660f72
+index 0000000..55074f8
 --- /dev/null
 +++ b/client/src/__tests__/liveQueryLog.test.ts
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,131 @@
 +import { describe, expect, it } from 'vitest';
 +
 +import {
@@ -128,6 +128,27 @@ index 0000000..b660f72
 +    row(`2026-10-01T12:00:00.${String(count + offset - index).padStart(9, '0')}Z`));
 +
 +describe('bounded Live Query Log view', () => {
++    it('inserts a late record behind the newest row when the merge floor is the re-read window', () => {
++        const head = row('2026-10-01T12:00:10.000000000Z');
++        const late = row('2026-10-01T12:00:09.000000000Z');
++        const fresh = row('2026-10-01T12:00:11.000000000Z');
++        const state = createLiveLogView([head]);
++        expect(mergeLiveLogView(state, [fresh, head, late], true).logs).toHaveLength(2);
++        const next = mergeLiveLogView(state, [fresh, head, late], true, '2026-10-01T12:00:07.000000000Z');
++        expect(next.logs.map((entry) => entry.time)).toEqual([fresh.time, head.time, late.time]);
++        const again = mergeLiveLogView(next, [fresh, head, late], true, '2026-10-01T12:00:08.000000000Z');
++        expect(again).toBe(next);
++    });
++
++    it('keeps late records within a batch larger than the rendered view', () => {
++        const batch = Array.from({ length: 1200 }, (_, index) =>
++            row(`2026-10-01T12:00:00.${String(1200 - index).padStart(9, '0')}Z`));
++        const state = createLiveLogView([]);
++        const merged = mergeLiveLogView(state, batch, false, '');
++        expect(merged.livePending).toHaveLength(LIVE_LOG_MAX_ROWS);
++        expect(merged.liveSeen).toHaveLength(1200);
++    });
++
 +    it('prepends only new queries and reuses existing row objects and unchanged state', () => {
 +        const first = row('2026-10-01T12:00:00.000000001Z');
 +        const state = createLiveLogView([first]);
@@ -224,16 +245,17 @@ index 0000000..b660f72
 +});
 diff --git a/client/src/__tests__/liveQueryLogRecovery.test.ts b/client/src/__tests__/liveQueryLogRecovery.test.ts
 new file mode 100644
-index 0000000..9803f10
+index 0000000..0885b70
 --- /dev/null
 +++ b/client/src/__tests__/liveQueryLogRecovery.test.ts
-@@ -0,0 +1,436 @@
+@@ -0,0 +1,547 @@
 +import { describe, expect, it, vi } from 'vitest';
 +
 +import { compareTimes, identifyLiveLogs, LiveLogRow } from '../helpers/liveQueryLog';
 +import {
 +    LIVE_LOG_RECOVERY_MAX_DURATION_MS, LIVE_LOG_RECOVERY_MAX_PAGES, LIVE_LOG_RECOVERY_MAX_ROWS,
-+    LiveLogCheckpoint, LiveLogPage, recoverLiveLogs,
++    LIVE_LOG_LATE_WINDOW_MS, LIVE_LOG_LATE_WINDOW_ROWS, LiveLogCheckpoint, LiveLogPage, LiveLogRecoveryOptions,
++    liveLogWindowStart, recoverLiveLogs, shiftLiveLogTime,
 +} from '../helpers/liveQueryLogRecovery';
 +
 +const time = (value: number) => `2026-10-01T12:00:00.${String(value).padStart(9, '0')}Z`;
@@ -248,6 +270,11 @@ index 0000000..9803f10
 +        keys: identified.filter((entry) => entry.time === identified[0].time).map((entry) => entry.liveKey!),
 +    };
 +};
++// Rows here are nanoseconds apart, so these cases exercise overlap without the late-arrival window.
++const recover = (
++    fetchPage: Parameters<typeof recoverLiveLogs>[0], checkpoint: LiveLogCheckpoint | null,
++    options: LiveLogRecoveryOptions = {},
++) => recoverLiveLogs(fetchPage, checkpoint, { lateWindowMs: 0, ...options });
 +const baseline = () => checkpointFor([row(1)]);
 +const emptyBaseline = (): LiveLogCheckpoint => ({ time: '', keys: [] });
 +const page = (logs: LiveLogRow[], oldest = ''): LiveLogPage => ({ logs, oldest });
@@ -273,7 +300,7 @@ index 0000000..9803f10
 +        const head = row(3);
 +        const other = row(3, { domain: 'other.test' });
 +        const fetchPage = scripted(page([row(2), head, head, other], time(2)));
-+        const result = await recoverLiveLogs(fetchPage, null);
++        const result = await recover(fetchPage, null);
 +        expect(fetchPage).toHaveBeenCalledExactlyOnceWith(undefined);
 +        expect(result.checkpoint).toEqual(checkpointFor([head, head, other]));
 +        expect(result.checkpoint.keys).toHaveLength(3);
@@ -283,13 +310,13 @@ index 0000000..9803f10
 +
 +    it('does not retrospectively drain a full initial page', async () => {
 +        const fetchPage = scripted(page(rows(100), time(1)));
-+        expect((await recoverLiveLogs(fetchPage, null)).gap).toBe(false);
++        expect((await recover(fetchPage, null)).gap).toBe(false);
 +        expect(fetchPage).toHaveBeenCalledTimes(1);
 +    });
 +
 +    it('records an empty successful initial baseline without draining its scan cursor', async () => {
 +        const fetchPage = scripted(page([], time(100)));
-+        expect(await recoverLiveLogs(fetchPage, null)).toEqual({ logs: [], checkpoint: emptyBaseline(), gap: false });
++        expect(await recover(fetchPage, null)).toEqual({ logs: [], checkpoint: emptyBaseline(), gap: false });
 +        expect(fetchPage).toHaveBeenCalledTimes(1);
 +    });
 +
@@ -297,7 +324,7 @@ index 0000000..9803f10
 +        const entries = rows(count + 1);
 +        const fetchPage = history(entries);
 +        const onCatchUp = vi.fn();
-+        const result = await recoverLiveLogs(fetchPage, baseline(), { onCatchUp });
++        const result = await recover(fetchPage, baseline(), { onCatchUp });
 +        expect(result.gap).toBe(false);
 +        expect(result.logs.map((entry) => entry.time)).toEqual(entries.map((entry) => entry.time));
 +        expect(result.logs).toHaveLength(count + 1);
@@ -307,18 +334,18 @@ index 0000000..9803f10
 +        expect(result.checkpoint).toEqual(checkpointFor(entries.slice(0, 100)));
 +    });
 +
-+    it('bounds 1100 new rows at ten pages and rebases to avoid repeating expensive backfill', async () => {
-+        const fetchPage = history(rows(1101));
-+        const result = await recoverLiveLogs(fetchPage, baseline());
++    it('bounds 2100 new rows at twenty pages and rebases to avoid repeating expensive backfill', async () => {
++        const fetchPage = history(rows(2101));
++        const result = await recover(fetchPage, baseline());
 +        expect(result.gap).toBe(true);
 +        expect(result.reason).toBe('page-budget');
 +        expect(result.logs).toHaveLength(LIVE_LOG_RECOVERY_MAX_ROWS);
-+        expect(result.logs[0].time).toBe(time(1101));
-+        expect(result.logs[999].time).toBe(time(102));
++        expect(result.logs[0].time).toBe(time(2101));
++        expect(result.logs[1999].time).toBe(time(102));
 +        expect(fetchPage).toHaveBeenCalledTimes(LIVE_LOG_RECOVERY_MAX_PAGES);
-+        expect(result.checkpoint).toEqual(checkpointFor(rows(100, 1001)));
++        expect(result.checkpoint).toEqual(checkpointFor(rows(100, 2001)));
 +        fetchPage.mockClear();
-+        expect((await recoverLiveLogs(fetchPage, result.checkpoint)).gap).toBe(false);
++        expect((await recover(fetchPage, result.checkpoint)).gap).toBe(false);
 +        expect(fetchPage).toHaveBeenCalledTimes(1);
 +    });
 +
@@ -326,7 +353,7 @@ index 0000000..9803f10
 +        const late = row(3, { elapsedMs: '1200' });
 +        const fetchPage = scripted(page([late, row(6), row(5)], time(3)));
 +        const onCatchUp = vi.fn();
-+        const result = await recoverLiveLogs(fetchPage, checkpointFor([row(5)]), { onCatchUp });
++        const result = await recover(fetchPage, checkpointFor([row(5)]), { onCatchUp });
 +        expect(result.gap).toBe(false);
 +        expect(result.logs.map((entry) => entry.time)).toEqual([time(6), time(5), time(3)]);
 +        expect(result.logs[2].elapsedMs).toBe('1200');
@@ -337,9 +364,10 @@ index 0000000..9803f10
 +    it('preserves full nanoseconds and sorts pages without mutating them', async () => {
 +        const input = [row(102), row(104), row(103)];
 +        const fetchPage = scripted(page(input, time(102)), page([row(101), row(100)]));
-+        const result = await recoverLiveLogs(fetchPage, checkpointFor([row(100)]));
++        const result = await recover(fetchPage, checkpointFor([row(100)]));
 +        expect(result.logs.map((entry) => entry.time)).toEqual([104, 103, 102, 101, 100].map(time));
 +        expect(input.map((entry) => entry.time)).toEqual([102, 104, 103].map(time));
++        // A short page holds every record down to its cursor, so the next request stays exclusive.
 +        expect(fetchPage.mock.calls).toEqual([[undefined], [time(102)]]);
 +    });
 +});
@@ -349,7 +377,7 @@ index 0000000..9803f10
 +        const first = row(5, { domain: 'first.test' });
 +        const second = row(5, { domain: 'second.test' });
 +        const fetchPage = scripted(page([row(6), first], time(5)), page([second, row(4)]));
-+        const result = await recoverLiveLogs(fetchPage, checkpointFor([first, second]));
++        const result = await recover(fetchPage, checkpointFor([first, second]));
 +        expect(result.gap).toBe(false);
 +        expect(result.logs).toHaveLength(4);
 +        expect(fetchPage).toHaveBeenCalledTimes(2);
@@ -359,7 +387,7 @@ index 0000000..9803f10
 +        const first = row(5);
 +        const second = row(5, { domain: 'missing.test' });
 +        const fetchPage = scripted(page([row(6), first], time(5)), page([row(4)], time(4)));
-+        const result = await recoverLiveLogs(fetchPage, checkpointFor([first, second]));
++        const result = await recover(fetchPage, checkpointFor([first, second]));
 +        expect(result.gap).toBe(true);
 +        expect(result.reason).toBe('checkpoint-missing');
 +        expect(fetchPage).toHaveBeenCalledTimes(2);
@@ -368,19 +396,18 @@ index 0000000..9803f10
 +    it('requires missing occurrence keys rather than accepting one indistinguishable duplicate', async () => {
 +        const duplicate = row(5);
 +        const fetchPage = scripted(page([row(6), duplicate], time(5)), page([row(4)]));
-+        const result = await recoverLiveLogs(fetchPage, checkpointFor([duplicate, duplicate]));
-+        expect(fetchPage).toHaveBeenCalledTimes(2);
++        const result = await recover(fetchPage, checkpointFor([duplicate, duplicate]));
++        expect(fetchPage.mock.calls).toEqual([[undefined], [time(5)]]);
 +        expect(result.gap).toBe(true);
-+        expect(result.reason).toBe('ambiguous-frontier');
++        expect(result.reason).toBe('checkpoint-missing');
 +    });
 +
-+    it.each([1, 2])('flags duplicate frontier ambiguity with %i prior occurrences, despite overlap', async (count) => {
++    it.each([1, 2])('accepts duplicate frontier identities when %i prior occurrences are all present', async (count) => {
 +        const duplicate = row(5);
 +        const fetchPage = scripted(page([row(6), duplicate, duplicate], time(5)));
-+        const result = await recoverLiveLogs(fetchPage, checkpointFor(Array(count).fill(duplicate)));
++        const result = await recover(fetchPage, checkpointFor(Array(count).fill(duplicate)));
 +        expect(result.logs).toHaveLength(3);
-+        expect(result.gap).toBe(true);
-+        expect(result.reason).toBe('ambiguous-frontier');
++        expect(result.gap).toBe(false);
 +        expect(fetchPage).toHaveBeenCalledTimes(1);
 +    });
 +
@@ -391,7 +418,7 @@ index 0000000..9803f10
 +            page([row(6), duplicate, duplicate], time(5)),
 +            page([renamed, renamed, renamed, row(4), row(1)]),
 +        );
-+        const result = await recoverLiveLogs(fetchPage, baseline());
++        const result = await recover(fetchPage, baseline());
 +        expect(result.gap).toBe(false);
 +        expect(result.logs).toHaveLength(6);
 +        expect(result.logs.filter((entry) => entry.time === time(5))).toHaveLength(3);
@@ -403,7 +430,7 @@ index 0000000..9803f10
 +        const second = row(5, { domain: 'second.test' });
 +        const full = [...rows(98, 5), first, second];
 +        const fetchPage = scripted(page(full, time(5)), page([row(4), row(1)]));
-+        const result = await recoverLiveLogs(fetchPage, overlap ? checkpointFor([first, second]) : baseline());
++        const result = await recover(fetchPage, overlap ? checkpointFor([first, second]) : baseline());
 +        expect(result.gap).toBe(true);
 +        expect(result.reason).toBe('ambiguous-page-boundary');
 +        expect(fetchPage).toHaveBeenCalledTimes(overlap ? 1 : 2);
@@ -413,12 +440,12 @@ index 0000000..9803f10
 +        const first = row(5, { domain: 'first.test' });
 +        const second = row(5, { domain: 'second.test' });
 +        const fetchPage = scripted(page([...rows(98, 5), first, second]));
-+        expect((await recoverLiveLogs(fetchPage, checkpointFor([first, second]))).gap).toBe(false);
++        expect((await recover(fetchPage, checkpointFor([first, second]))).gap).toBe(false);
 +    });
 +
 +    it('accepts timestamp ties away from the cursor boundary', async () => {
 +        const entries = [...rows(97, 5), row(5), row(5, { type: 'AAAA' }), row(1)];
-+        expect((await recoverLiveLogs(scripted(page(entries, time(1))), baseline())).gap).toBe(false);
++        expect((await recover(scripted(page(entries, time(1))), baseline())).gap).toBe(false);
 +    });
 +});
 +
@@ -427,7 +454,7 @@ index 0000000..9803f10
 +        const fetchPage = scripted(
 +            page(rows(100, 200), time(201)), page(rows(2, 100), time(100)), page([row(50)]),
 +        );
-+        const result = await recoverLiveLogs(fetchPage, emptyBaseline());
++        const result = await recover(fetchPage, emptyBaseline());
 +        expect(result.gap).toBe(false);
 +        expect(result.logs).toHaveLength(103);
 +        expect(fetchPage).toHaveBeenCalledTimes(3);
@@ -435,7 +462,7 @@ index 0000000..9803f10
 +
 +    it('does not assume a short newest page is exhausted for a previously empty baseline', async () => {
 +        const fetchPage = scripted(page([row(5)], time(4)), page([row(3)]));
-+        const result = await recoverLiveLogs(fetchPage, emptyBaseline());
++        const result = await recover(fetchPage, emptyBaseline());
 +        expect(result.logs).toHaveLength(2);
 +        expect(result.gap).toBe(false);
 +        expect(fetchPage).toHaveBeenCalledTimes(2);
@@ -445,7 +472,7 @@ index 0000000..9803f10
 +        const fetchPage = scripted(
 +            page([], time(10)), page([], time(8)), page([row(7)], time(5)), page([row(1)]),
 +        );
-+        const result = await recoverLiveLogs(fetchPage, baseline());
++        const result = await recover(fetchPage, baseline());
 +        expect(result.gap).toBe(false);
 +        expect(result.logs.map((entry) => entry.time)).toEqual([time(7), time(1)]);
 +        expect(result.checkpoint).toEqual(checkpointFor([row(7)]));
@@ -454,7 +481,7 @@ index 0000000..9803f10
 +
 +    it('drains empty progressing scans from an empty baseline', async () => {
 +        const fetchPage = scripted(page([], time(10)), page([], time(5)), page([]));
-+        expect(await recoverLiveLogs(fetchPage, emptyBaseline())).toEqual({
++        expect(await recover(fetchPage, emptyBaseline())).toEqual({
 +            logs: [], checkpoint: emptyBaseline(), gap: false,
 +        });
 +        expect(fetchPage).toHaveBeenCalledTimes(3);
@@ -462,13 +489,13 @@ index 0000000..9803f10
 +
 +    it('detects an empty scan passing the frontier without another request', async () => {
 +        const fetchPage = scripted(page([], time(4)));
-+        expect((await recoverLiveLogs(fetchPage, checkpointFor([row(5)]))).reason).toBe('checkpoint-missing');
++        expect((await recover(fetchPage, checkpointFor([row(5)]))).reason).toBe('checkpoint-missing');
 +        expect(fetchPage).toHaveBeenCalledTimes(1);
 +    });
 +
 +    it.each([false, true])('reports expired checkpoints with older rows=%s', async (older) => {
 +        const fetchPage = scripted(older ? page([row(3)], time(3)) : page([]));
-+        const result = await recoverLiveLogs(fetchPage, checkpointFor([row(5)]));
++        const result = await recover(fetchPage, checkpointFor([row(5)]));
 +        expect(result.gap).toBe(true);
 +        expect(result.reason).toBe('checkpoint-missing');
 +        expect(result.checkpoint).toEqual(older ? checkpointFor([row(3)])
@@ -478,7 +505,7 @@ index 0000000..9803f10
 +    it.each([undefined, null, 12, 'garbage', '0', '2026-10-01', '2026-10-01T25:00:00Z'])(
 +        'guards missing or malformed cursor %s', async (oldest) => {
 +            const fetchPage = scripted({ logs: [row(5)], oldest } as LiveLogPage);
-+            const result = await recoverLiveLogs(fetchPage, baseline());
++            const result = await recover(fetchPage, baseline());
 +            expect(result.reason).toBe('invalid-cursor');
 +            expect(result.gap).toBe(true);
 +            expect(fetchPage).toHaveBeenCalledTimes(1);
@@ -486,7 +513,7 @@ index 0000000..9803f10
 +    );
 +
 +    it('validates initial baseline cursors', async () => {
-+        const result = await recoverLiveLogs(scripted(page([row(5)], 'bad')), null);
++        const result = await recover(scripted(page([row(5)], 'bad')), null);
 +        expect(result.reason).toBe('invalid-cursor');
 +        expect(result.checkpoint).toEqual(checkpointFor([row(5)]));
 +    });
@@ -494,7 +521,7 @@ index 0000000..9803f10
 +    it.each([time(5), time(6), '2026-10-01T12:00:00.000000005+00:00'])(
 +        'guards repeated or increasing cursor %s', async (oldest) => {
 +            const fetchPage = scripted(page([row(10)], time(5)), page([], oldest));
-+            const result = await recoverLiveLogs(fetchPage, baseline());
++            const result = await recover(fetchPage, baseline());
 +            expect(result.reason).toBe('nonprogressing-cursor');
 +            expect(fetchPage).toHaveBeenCalledTimes(2);
 +            expect(result.checkpoint).toEqual(checkpointFor([row(10)]));
@@ -507,7 +534,7 @@ index 0000000..9803f10
 +        const now = vi.spyOn(performance, 'now').mockReturnValueOnce(0).mockReturnValue(5000);
 +        try {
 +            const fetchPage = scripted(page(rows(100, 100), time(101)));
-+            const result = await recoverLiveLogs(fetchPage, baseline());
++            const result = await recover(fetchPage, baseline());
 +            expect(result.reason).toBe('time-budget');
 +            expect(result.checkpoint).toEqual(checkpointFor(rows(100, 100)));
 +            expect(fetchPage).toHaveBeenCalledTimes(1);
@@ -523,7 +550,7 @@ index 0000000..9803f10
 +            elapsed += 2000;
 +            return page([row(100 - elapsed / 1000)], time(99 - elapsed / 1000));
 +        });
-+        const result = await recoverLiveLogs(fetchPage, baseline(), { now: () => elapsed });
++        const result = await recover(fetchPage, baseline(), { now: () => elapsed });
 +        expect(result.reason).toBe('time-budget');
 +        expect(fetchPage).toHaveBeenCalledTimes(3);
 +        expect(result.logs).toHaveLength(3);
@@ -531,17 +558,17 @@ index 0000000..9803f10
 +
 +    it('supports reduced budgets while capping increased options at hard limits', async () => {
 +        const limited = history(rows(1000));
-+        expect((await recoverLiveLogs(limited, baseline(), { maxPages: 2 })).reason).toBe('page-budget');
++        expect((await recover(limited, baseline(), { maxPages: 2 })).reason).toBe('page-budget');
 +        expect(limited).toHaveBeenCalledTimes(2);
-+        const capped = history(rows(2000));
-+        await recoverLiveLogs(capped, baseline(), { maxPages: 100 });
-+        expect(capped).toHaveBeenCalledTimes(10);
++        const capped = history(rows(3000));
++        await recover(capped, baseline(), { maxPages: 100 });
++        expect(capped).toHaveBeenCalledTimes(LIVE_LOG_RECOVERY_MAX_PAGES);
 +        let elapsed = 0;
 +        const timed = vi.fn(async () => {
 +            elapsed += 5000;
 +            return page([row(10)], time(10));
 +        });
-+        const result = await recoverLiveLogs(timed, baseline(), { now: () => elapsed, maxDurationMs: 100000 });
++        const result = await recover(timed, baseline(), { now: () => elapsed, maxDurationMs: 100000 });
 +        expect(result.reason).toBe('time-budget');
 +        expect(timed).toHaveBeenCalledTimes(1);
 +    });
@@ -551,21 +578,21 @@ index 0000000..9803f10
 +        const snapshot = JSON.stringify(original);
 +        const error = new Error('disconnected');
 +        const fetchPage = vi.fn().mockResolvedValueOnce(page([row(3)], time(3))).mockRejectedValueOnce(error);
-+        const result = await recoverLiveLogs(fetchPage, original);
++        const result = await recover(fetchPage, original);
 +        expect(result.error).toBe(error);
 +        expect(result.checkpoint).toBe(original);
 +        expect(result.gap).toBe(false);
 +        expect(result.reason).toBeUndefined();
 +        expect(result.logs).toEqual(identifyLiveLogs([row(3)]));
 +        expect(JSON.stringify(original)).toBe(snapshot);
-+        const retry = await recoverLiveLogs(history(rows(3)), result.checkpoint);
++        const retry = await recover(history(rows(3)), result.checkpoint);
 +        expect(retry.gap).toBe(false);
 +        expect(retry.logs).toHaveLength(3);
 +    });
 +
 +    it.each([null, baseline()])('preserves the input checkpoint on initial fetch failure (%s)', async (original) => {
 +        const error = new Error('offline');
-+        const result = await recoverLiveLogs(vi.fn().mockRejectedValue(error), original);
++        const result = await recover(vi.fn().mockRejectedValue(error), original);
 +        expect(result).toEqual({ logs: [], checkpoint: original, gap: false, error });
 +    });
 +
@@ -575,7 +602,7 @@ index 0000000..9803f10
 +        Object.freeze(original);
 +        const entries = [Object.freeze(row(3)), Object.freeze(row(1))];
 +        Object.freeze(entries);
-+        expect((await recoverLiveLogs(scripted(page(entries)), original)).gap).toBe(false);
++        expect((await recover(scripted(page(entries)), original)).gap).toBe(false);
 +        expect(original).toEqual(baseline());
 +    });
 +
@@ -589,7 +616,7 @@ index 0000000..9803f10
 +            return olderThan ? page([row(1)]) : page([row(3)], time(3));
 +        });
 +        const onCatchUp = vi.fn();
-+        expect((await recoverLiveLogs(fetchPage, baseline(), { onCatchUp })).gap).toBe(false);
++        expect((await recover(fetchPage, baseline(), { onCatchUp })).gap).toBe(false);
 +        expect(onCatchUp).toHaveBeenCalledTimes(1);
 +    });
 +
@@ -599,7 +626,7 @@ index 0000000..9803f10
 +            controller.abort();
 +        }
 +        const fetchPage = scripted(page([row(2)]));
-+        await expect(recoverLiveLogs(fetchPage, baseline(), {
++        await expect(recover(fetchPage, baseline(), {
 +            signal: controller.signal, isCurrent: () => kind !== 'stale',
 +        })).rejects.toMatchObject({ name: 'AbortError' });
 +        expect(fetchPage).not.toHaveBeenCalled();
@@ -617,7 +644,7 @@ index 0000000..9803f10
 +            }
 +            return page([row(3), row(1)]);
 +        });
-+        await expect(recoverLiveLogs(fetchPage, original, {
++        await expect(recover(fetchPage, original, {
 +            signal: controller.signal, isCurrent: () => current,
 +        })).rejects.toMatchObject({ name: 'AbortError' });
 +        expect(original).toEqual(baseline());
@@ -627,7 +654,7 @@ index 0000000..9803f10
 +    it('checks cancellation after onCatchUp before the next request', async () => {
 +        const controller = new AbortController();
 +        const fetchPage = scripted(page([row(3)], time(3)));
-+        await expect(recoverLiveLogs(fetchPage, baseline(), {
++        await expect(recover(fetchPage, baseline(), {
 +            signal: controller.signal, onCatchUp: () => controller.abort(),
 +        })).rejects.toMatchObject({ name: 'AbortError' });
 +        expect(fetchPage).toHaveBeenCalledTimes(1);
@@ -635,34 +662,139 @@ index 0000000..9803f10
 +
 +    it('rejects independently aborted fetches', async () => {
 +        const error = new DOMException('Request deadline', 'AbortError');
-+        await expect(recoverLiveLogs(vi.fn().mockRejectedValue(error), baseline()))
++        await expect(recover(vi.fn().mockRejectedValue(error), baseline()))
 +            .rejects.toMatchObject({ name: 'AbortError' });
 +    });
 +    it('rebases an empty first page onto recovered rows and avoids repeating the page budget', async () => {
 +        const initial = scripted(page([], time(50)), page([row(40)], time(40)));
-+        const result = await recoverLiveLogs(initial, baseline(), { maxPages: 2 });
++        const result = await recover(initial, baseline(), { maxPages: 2 });
 +        expect(result.reason).toBe('page-budget');
 +        expect(result.checkpoint).toEqual(checkpointFor([row(40)]));
 +        const again = scripted(page([], time(50)), page([row(40)], time(40)));
-+        const next = await recoverLiveLogs(again, result.checkpoint);
++        const next = await recover(again, result.checkpoint);
 +        expect(next.gap).toBe(false);
 +        expect(again).toHaveBeenCalledTimes(2);
 +    });
 +
 +    it('probes only the head after an all-empty scan exhausts its budget', async () => {
 +        const initial = scripted(page([], time(50)), page([], time(40)));
-+        const result = await recoverLiveLogs(initial, baseline(), { maxPages: 2 });
++        const result = await recover(initial, baseline(), { maxPages: 2 });
 +        expect(result.checkpoint).toEqual({ ...baseline(), limited: true });
 +        const again = scripted(page([], time(50)));
-+        const next = await recoverLiveLogs(again, result.checkpoint);
++        const next = await recover(again, result.checkpoint);
 +        expect(again).toHaveBeenCalledTimes(1);
 +        expect(next.gap).toBe(true);
 +        expect(next.checkpoint).toEqual(result.checkpoint);
-+        const fresh = await recoverLiveLogs(scripted(page([row(60)], time(50))), next.checkpoint);
++        const fresh = await recover(scripted(page([row(60)], time(50))), next.checkpoint);
 +        expect(fresh.checkpoint).toEqual(checkpointFor([row(60)]));
 +        expect(fresh.gap).toBe(true);
 +    });
 +
++});
++
++describe('late-arrival window', () => {
++    const base = '2026-10-01T12:00:00.000000000Z';
++    const at = (ms: number, extra = {}): LiveLogRow => ({
++        time: shiftLiveLogTime(base, ms), domain: `t${ms}.test`, client: '192.0.2.1', type: 'A', ...extra,
++    });
++
++    it('shifts timestamps by milliseconds, keeping sub-millisecond digits and normalising to UTC', () => {
++        expect(shiftLiveLogTime('2026-10-01T12:00:00.000123456Z', -3000)).toBe('2026-10-01T11:59:57.000123456Z');
++        expect(shiftLiveLogTime('2026-10-01T14:00:00.5+02:00', -3000)).toBe('2026-10-01T11:59:57.500000000Z');
++        expect(shiftLiveLogTime('2026-10-01T12:00:00Z', 1)).toBe('2026-10-01T12:00:00.001000000Z');
++    });
++
++    it('only requests cursors that the server returned', async () => {
++        const head = at(10000);
++        const entries = [...Array.from({ length: 250 }, (_, index) => at(10999 - index)), head,
++            ...Array.from({ length: 300 }, (_, index) => at(9999 - index * 10))];
++        const fetchPage = history(entries);
++        const returned = new Set<string | undefined>([undefined]);
++        const wrapped = vi.fn(async (olderThan?: string) => {
++            expect(returned.has(olderThan)).toBe(true);
++            const result = await fetchPage(olderThan);
++            returned.add(result.oldest);
++            return result;
++        });
++        expect((await recoverLiveLogs(wrapped, checkpointFor([head]))).gap).toBe(false);
++        expect(wrapped.mock.calls.length).toBeGreaterThan(3);
++    });
++
++    it('computes the window start from the checkpoint', () => {
++        expect(liveLogWindowStart(null)).toBeUndefined();
++        expect(liveLogWindowStart({ time: '', keys: [] })).toBe('');
++        expect(liveLogWindowStart(checkpointFor([at(10000)]))).toBe(at(10000 - LIVE_LOG_LATE_WINDOW_MS).time);
++        expect(liveLogWindowStart(checkpointFor([at(10000)]), 0)).toBe(at(10000).time);
++    });
++
++    it('recovers a record that became visible behind the checkpoint', async () => {
++        const head = at(10000);
++        const late = at(9500);
++        const fetchPage = history([at(11000), head, late, at(1000)]);
++        const result = await recoverLiveLogs(fetchPage, checkpointFor([head]));
++        expect(result.gap).toBe(false);
++        expect(result.logs.map((entry) => entry.time)).toContain(late.time);
++        expect(fetchPage).toHaveBeenCalledTimes(1);
++    });
++
++    it('reads past the checkpoint page to cover the window without signalling catch-up', async () => {
++        const head = at(10000);
++        const late = at(8000);
++        const fresh = Array.from({ length: 99 }, (_, index) => at(10100 + index));
++        const entries = [...fresh.reverse(), head, late, at(1000)];
++        const fetchPage = history(entries);
++        const onCatchUp = vi.fn();
++        const result = await recoverLiveLogs(fetchPage, checkpointFor([head]), { onCatchUp });
++        expect(fetchPage.mock.calls).toEqual([[undefined], [head.time]]);
++        expect(result.gap).toBe(false);
++        expect(result.logs).toHaveLength(entries.length);
++        expect(onCatchUp).not.toHaveBeenCalled();
++        expect(result.checkpoint).toEqual(checkpointFor([entries[0]]));
++    });
++
++    it('stops as soon as a page reaches rows older than the window', async () => {
++        const head = at(10000);
++        const fetchPage = scripted(page([at(10500), head, at(6000)], at(6000).time));
++        const result = await recoverLiveLogs(fetchPage, checkpointFor([head]));
++        expect(result.gap).toBe(false);
++        expect(fetchPage).toHaveBeenCalledTimes(1);
++    });
++
++    it('stops re-reading after the row bound behind the checkpoint', async () => {
++        const head = at(10000);
++        // 600 rows within one second behind the checkpoint: the row bound ends the re-read first.
++        const behind = Array.from({ length: 600 }, (_, index) => at(9999 - index));
++        const fetchPage = history([head, ...behind, at(1000)]);
++        const result = await recoverLiveLogs(fetchPage, checkpointFor([head]));
++        expect(result.gap).toBe(false);
++        // Pages: 1 head + 99 behind, then 100 more per page until at least 500 are behind.
++        expect(fetchPage).toHaveBeenCalledTimes(6);
++        expect(LIVE_LOG_LATE_WINDOW_ROWS).toBe(500);
++    });
++
++    it('retries a briefly hidden checkpoint once before reporting it missing', async () => {
++        const head = at(10000);
++        const fresh = at(10500);
++        const hidden = await recoverLiveLogs(history([fresh, at(1000)]), checkpointFor([head]));
++        expect(hidden.gap).toBe(false);
++        expect(hidden.checkpoint).toEqual({ ...checkpointFor([head]), retry: true });
++        expect(hidden.logs.map((entry) => entry.time)).toContain(fresh.time);
++        const visible = await recoverLiveLogs(history([fresh, head, at(1000)]), hidden.checkpoint);
++        expect(visible.gap).toBe(false);
++        expect(visible.checkpoint).toEqual(checkpointFor([fresh]));
++        const gone = await recoverLiveLogs(history([fresh, at(1000)]), hidden.checkpoint);
++        expect(gone.gap).toBe(true);
++        expect(gone.reason).toBe('checkpoint-missing');
++        expect(gone.checkpoint).toEqual(checkpointFor([fresh]));
++    });
++
++    it('reports a gap when the page budget ends before the window is covered', async () => {
++        const head = at(10000);
++        const fetchPage = scripted(page([at(10500), head], head.time), page([at(9000)], at(9000).time));
++        const result = await recoverLiveLogs(fetchPage, checkpointFor([head]), { maxPages: 2 });
++        expect(result.gap).toBe(true);
++        expect(result.reason).toBe('page-budget');
++    });
 +});
 diff --git a/client/src/__tests__/queryLogsRequests.test.ts b/client/src/__tests__/queryLogsRequests.test.ts
 new file mode 100644
@@ -872,10 +1004,10 @@ index 0000000..61a1fbe
 +});
 diff --git a/client/src/__tests__/useLiveQueryLog.test.tsx b/client/src/__tests__/useLiveQueryLog.test.tsx
 new file mode 100644
-index 0000000..1174e3b
+index 0000000..c319253
 --- /dev/null
 +++ b/client/src/__tests__/useLiveQueryLog.test.tsx
-@@ -0,0 +1,676 @@
+@@ -0,0 +1,729 @@
 +import React, { useRef } from 'react';
 +import ReactDOM from 'react-dom';
 +import { act } from 'react-dom/test-utils';
@@ -892,6 +1024,19 @@ index 0000000..1174e3b
 +import { normalizeLogs } from '../helpers/helpers';
 +
 +vi.mock('../api/Api', () => ({ default: { getQueryLog: vi.fn(), clearQueryLog: vi.fn() } }));
++
++// Most fixtures are nanoseconds apart; lifecycle cases disable the late-arrival window unless a test sets it.
++const lateWindow = vi.hoisted(() => ({ ms: 0 }));
++vi.mock('../helpers/liveQueryLogRecovery', async (importOriginal) => {
++    const actual = await importOriginal<typeof import('../helpers/liveQueryLogRecovery')>();
++    return {
++        ...actual,
++        recoverLiveLogs: (fetchPage: any, checkpoint: any, options: any = {}) => actual.recoverLiveLogs(
++            fetchPage, checkpoint, { lateWindowMs: lateWindow.ms, ...options },
++        ),
++        liveLogWindowStart: (checkpoint: any) => actual.liveLogWindowStart(checkpoint, lateWindow.ms),
++    };
++});
 +
 +const rawRow = (id: number) => ({
 +    time: `2026-10-01T12:00:00.${String(id).padStart(9, '0')}Z`, client: '192.0.2.10',
@@ -931,6 +1076,7 @@ index 0000000..1174e3b
 +
 +    beforeEach(() => {
 +        vi.useFakeTimers();
++        lateWindow.ms = 0;
 +        vi.mocked(apiClient.getQueryLog).mockReset().mockResolvedValue(response(1));
 +        localStorage.clear();
 +        Object.defineProperty(navigator, 'onLine', { configurable: true, value: true });
@@ -1184,20 +1330,59 @@ index 0000000..1174e3b
 +        expect(controls.status).toBe('synced');
 +    });
 +
-+    it('bounds a >1000 burst, retains a gap after success, and avoids retrying old backfill', async () => {
++    it.each([3000, 0])('with a %ims window, adds a query that became visible behind a full page', async (ms) => {
++        lateWindow.ms = ms;
++        const at = (millis: number, name: string) => ({
++            ...rawRow(0), time: new Date(Date.parse('2026-10-01T12:00:00Z') + millis).toISOString()
++                .replace(/Z$/, '000000Z'),
++            question: { name, type: 'A' },
++        });
++        const records = [at(10000, 'head.test'), at(1000, 'old.test')];
++        serve(records);
++        mount();
++        await tick();
++        // A burst fills the newest page down to the checkpoint, and an older record appears late.
++        const fresh = Array.from({ length: 99 }, (_, index) => at(11000 + 99 - index, `fresh${index}.test`));
++        records.splice(1, 0, at(9000, 'late.test'));
++        records.unshift(...fresh);
++        await tick();
++        const domains = () => store.getState().queryLogs.logs.map((row: any) => row.domain);
++        expect(domains().includes('late.test')).toBe(ms > 0);
++        expect(new Set(domains()).size).toBe(domains().length);
++        expect(controls.status).toBe('synced');
++        await tick();
++        expect(domains().filter((domain: string) => domain === 'late.test')).toHaveLength(ms > 0 ? 1 : 0);
++    });
++
++    it('does not pull unread history below the baseline page into the view', async () => {
++        lateWindow.ms = 3000;
++        const records = dataset(200);
++        serve(records);
++        store.dispatch(getLogsSuccess({ logs: normalizeLogs(records.slice(0, 20)), oldest: records[19].time, older_than: '' }));
++        mount();
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(20);
++        records.unshift(rawRow(201));
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(21);
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(21);
++    });
++
++    it('bounds a >2000 burst, retains a gap after success, and avoids retrying old backfill', async () => {
 +        const records = dataset(1);
 +        serve(records);
 +        mount();
 +        await tick();
-+        records.unshift(...dataset(1100, 1));
++        records.unshift(...dataset(2100, 1));
 +        vi.mocked(apiClient.getQueryLog).mockClear();
 +        await tick();
-+        expect(apiClient.getQueryLog).toHaveBeenCalledTimes(10);
++        expect(apiClient.getQueryLog).toHaveBeenCalledTimes(20);
 +        expect(controls.status).toBe('gap');
 +        expect(controls.hasGap).toBe(true);
 +        expect(store.getState().queryLogs.logs).toHaveLength(500);
 +        await tick();
-+        expect(apiClient.getQueryLog).toHaveBeenCalledTimes(11);
++        expect(apiClient.getQueryLog).toHaveBeenCalledTimes(21);
 +        expect(controls.status).toBe('gap');
 +        act(() => controls.toggleLive());
 +        expect(controls.status).toBe('paused');
@@ -2509,10 +2694,10 @@ index 8f9013b..b2bf4f9 100644
                  isSmallScreen={isSmallScreen}
 diff --git a/client/src/components/Logs/useLiveQueryLog.ts b/client/src/components/Logs/useLiveQueryLog.ts
 new file mode 100644
-index 0000000..53ce8ff
+index 0000000..0487230
 --- /dev/null
 +++ b/client/src/components/Logs/useLiveQueryLog.ts
-@@ -0,0 +1,255 @@
+@@ -0,0 +1,267 @@
 +import { RefObject, useCallback, useEffect, useRef, useState } from 'react';
 +import { shallowEqual, useDispatch, useSelector } from 'react-redux';
 +
@@ -2527,7 +2712,7 @@ index 0000000..53ce8ff
 +    loadLiveLogPreference, saveLiveLogPreference, compareTimes, identifyLiveLogs,
 +} from '../../helpers/liveQueryLog';
 +import {
-+    recoverLiveLogs, checkpointFor, LiveLogCheckpoint, LIVE_LOG_RECOVERY_MAX_DURATION_MS,
++    recoverLiveLogs, checkpointFor, liveLogWindowStart, LiveLogCheckpoint, LIVE_LOG_RECOVERY_MAX_DURATION_MS,
 +} from '../../helpers/liveQueryLogRecovery';
 +import { RootState } from '../../initialState';
 +
@@ -2546,6 +2731,9 @@ index 0000000..53ce8ff
 +    const clearGeneration = useRef(0);
 +    const baselineOnly = useRef(false);
 +    const observedHead = useRef('');
++    // Oldest row read by the cycle that produced the checkpoint. Rows older than this were never read,
++    // so they are history, not late arrivals.
++    const readFloor = useRef('');
 +    const [clearRevision, setClearRevision] = useState(0);
 +    const [phase, setPhase] = useState('catching_up');
 +    const [hasGap, setHasGap] = useState(false);
@@ -2585,6 +2773,7 @@ index 0000000..53ce8ff
 +        if (checkpointFilter.current !== filterKey) {
 +            checkpointFilter.current = filterKey;
 +            checkpoint.current = null;
++            readFloor.current = '';
 +            observedHead.current = '';
 +            gap.current = false;
 +            baselineOnly.current = false;
@@ -2619,7 +2808,11 @@ index 0000000..53ce8ff
 +            let interrupted = false;
 +            let newestPage: any[];
 +            const processed = new Map<string, any>();
-+            const fromTime = checkpoint.current?.time;
++            // Late arrivals inside the re-read window must not be dropped by the view's floor, but only
++            // rows within the previous cycle's read range can be late; older ones are unread history.
++            const windowStart = liveLogWindowStart(checkpoint.current);
++            const fromTime = windowStart && readFloor.current && compareTimes(readFloor.current, windowStart) > 0
++                ? readFloor.current : windowStart;
 +            // The elapsed budget includes transport time, even for a stalled first page.
 +            const deadline = setTimeout(() => {
 +                timedOut = true;
@@ -2665,6 +2858,9 @@ index 0000000..53ce8ff
 +                    } else {
 +                        dispatch(receiveLiveLogs({ logs: result.logs, atTop: atTop.current, fromTime }));
 +                    }
++                    if (!result.error) {
++                        readFloor.current = result.logs[result.logs.length - 1]?.time || result.checkpoint?.time || '';
++                    }
 +                    checkpoint.current = result.checkpoint;
 +                    gap.current = gap.current || result.gap;
 +                    setHasGap(gap.current);
@@ -2681,6 +2877,7 @@ index 0000000..53ce8ff
 +                            .sort((left, right) => compareTimes(right.time, left.time));
 +                        const head = checkpointFor(logs);
 +                        checkpoint.current = head.time ? head : { ...checkpoint.current, limited: true };
++                        readFloor.current = logs[logs.length - 1]?.time || checkpoint.current.time;
 +                        gap.current = true;
 +                        setHasGap(true);
 +                        if (baselineOnly.current) {
@@ -2840,10 +3037,10 @@ index ba2de57..d4a8ffb 100644
 +};
 diff --git a/client/src/helpers/liveQueryLog.ts b/client/src/helpers/liveQueryLog.ts
 new file mode 100644
-index 0000000..ee36ad7
+index 0000000..94aa08c
 --- /dev/null
 +++ b/client/src/helpers/liveQueryLog.ts
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,149 @@
 +import i18next from 'i18next';
 +
 +import { LocalStorageHelper } from './localStorageHelper';
@@ -2855,6 +3052,8 @@ index 0000000..ee36ad7
 +export const LIVE_LOG_PAGE_SIZE = 100;
 +// At most 500 rendered rows plus 500 queued rows. Recent identities are also bounded.
 +export const LIVE_LOG_MAX_ROWS = 500;
++// One merged poll can carry a full recovery cycle, including the re-read late-arrival window.
++export const LIVE_LOG_MAX_BATCH = 2000;
 +
 +export type LiveLogRow = { time: string; liveKey?: string; [field: string]: any };
 +export type LiveLogView = {
@@ -2877,10 +3076,10 @@ index 0000000..ee36ad7
 +    row.elapsedMs, row.upstream, row.cached, row.answer_dnssec, row.ecs,
 +]);
 +
-+export const identifyLiveLogs = (rows: LiveLogRow[]): LiveLogRow[] => {
++export const identifyLiveLogs = (rows: LiveLogRow[], limit = LIVE_LOG_MAX_ROWS): LiveLogRow[] => {
 +    const occurrences = new Map<string, number>();
 +
-+    return rows.slice(0, LIVE_LOG_MAX_ROWS).map((row) => {
++    return rows.slice(0, limit).map((row) => {
 +        const identity = queryIdentity(row);
 +        const occurrence = occurrences.get(identity) || 0;
 +        occurrences.set(identity, occurrence + 1);
@@ -2909,7 +3108,7 @@ index 0000000..ee36ad7
 +export const mergeLiveLogView = <T extends LiveLogView>(
 +    state: T, incoming: LiveLogRow[], atTop: boolean, fromTime?: string,
 +): T => {
-+    const batch = identifyLiveLogs(incoming);
++    const batch = identifyLiveLogs(incoming, LIVE_LOG_MAX_BATCH);
 +    const seen = new Set([
 +        ...state.liveSeen,
 +        ...state.logs.map((row) => row.liveKey),
@@ -2971,7 +3170,7 @@ index 0000000..ee36ad7
 +    live_log_suspended: 'Suspended',
 +    live_log_paused: 'Paused',
 +    live_log_gap: 'Gap detected — some queries may not have been recovered.',
-+    live_log_status_hint: 'Continuity is checked against previously observed queries. The API cannot guarantee lossless delivery.',
++    live_log_status_hint: 'Each update re-checks the last few seconds for late queries. A gap is shown if continuity cannot be confirmed.',
 +    live_log_start: 'Start Live View',
 +    live_log_pause: 'Pause Live View',
 +    live_log_clear: 'Clear view',
@@ -2993,18 +3192,29 @@ index 0000000..ee36ad7
 +};
 diff --git a/client/src/helpers/liveQueryLogRecovery.ts b/client/src/helpers/liveQueryLogRecovery.ts
 new file mode 100644
-index 0000000..a1a45ca
+index 0000000..b63ef59
 --- /dev/null
 +++ b/client/src/helpers/liveQueryLogRecovery.ts
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,252 @@
 +import {
-+    compareTimes, identifyLiveLogs, LIVE_LOG_PAGE_SIZE, LiveLogRow, queryIdentity,
++    compareTimes, identifyLiveLogs, LIVE_LOG_PAGE_SIZE, LiveLogRow,
 +} from './liveQueryLog';
 +
 +/** Hard bounds for one sequential catch-up cycle, before the view's 500-row limit. */
-+export const LIVE_LOG_RECOVERY_MAX_PAGES = 10;
++export const LIVE_LOG_RECOVERY_MAX_PAGES = 20;
 +export const LIVE_LOG_RECOVERY_MAX_DURATION_MS = 5000;
-+export const LIVE_LOG_RECOVERY_MAX_ROWS = 1000;
++export const LIVE_LOG_RECOVERY_MAX_ROWS = LIVE_LOG_RECOVERY_MAX_PAGES * LIVE_LOG_PAGE_SIZE;
++
++/**
++ * How far behind the checkpoint every cycle re-reads. AdGuard Home can make a record visible
++ * after newer ones: it timestamps entries before taking the buffer lock, and a flush empties
++ * the memory buffer before the same records are written to the file. Both delays are
++ * milliseconds, so re-reading this window picks up records that were briefly invisible.
++ * The row bound keeps very busy servers within the page budget; 500 records cover far more
++ * than those delays at any realistic query rate.
++ */
++export const LIVE_LOG_LATE_WINDOW_MS = 3000;
++export const LIVE_LOG_LATE_WINDOW_ROWS = 500;
 +
 +/** Occurrence keys for the newest timestamp group across successfully processed pages. */
 +export interface LiveLogCheckpoint {
@@ -3012,6 +3222,8 @@ index 0000000..a1a45ca
 +    keys: string[];
 +    /** No observable rebase boundary: probe only the head until a fresh row is available. */
 +    limited?: boolean;
++    /** The checkpoint was not found once; the next cycle checks again before reporting a gap. */
++    retry?: boolean;
 +}
 +
 +/** The caller normalizes and validates rows; an empty oldest string means scan exhaustion. */
@@ -3028,13 +3240,14 @@ index 0000000..a1a45ca
 +    /** Aborting or becoming stale rejects with AbortError, including after an in-flight fetch. */
 +    signal?: AbortSignal;
 +    isCurrent?: () => boolean;
-+    /** Called once, immediately before the first additional page request. */
++    /** Called once, before the first additional request made to reach the checkpoint. */
 +    onCatchUp?: () => void;
 +    /** Defaults to performance.now. The caller must enforce actual request timeouts. */
 +    now?: () => number;
 +    /** Can reduce, but never increase, the hard bounds. At least one page is fetched. */
 +    maxPages?: number;
 +    maxDurationMs?: number;
++    lateWindowMs?: number;
 +}
 +
 +/** Rebase to the newest observed group with gaps explicit; API errors retain the input checkpoint. */
@@ -3055,6 +3268,30 @@ index 0000000..a1a45ca
 +    && (cursor === '' || (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(cursor)
 +        && Number.isFinite(Date.parse(cursor))));
 +
++const splitTime = (time: string) => ({
++    ms: Date.parse(time),
++    subMs: Number((time.match(/\.(\d+)/)?.[1] || '').padEnd(9, '0').slice(3, 9)),
++});
++
++/**
++ * Shift an RFC 3339 timestamp by whole milliseconds, keeping sub-millisecond digits (UTC). Only used for
++ * local comparisons: AdGuard Home's file search needs older_than to be the exact time of a stored record,
++ * so request cursors must always be the server's own oldest values.
++ */
++export const shiftLiveLogTime = (time: string, milliseconds: number) => {
++    const parts = splitTime(time);
++    const iso = new Date(parts.ms + milliseconds).toISOString();
++    return iso.replace(/Z$/, `${String(parts.subMs).padStart(6, '0')}Z`);
++};
++
++/** Oldest timestamp re-read by the next cycle; undefined before a baseline exists. */
++export const liveLogWindowStart = (checkpoint: LiveLogCheckpoint | null, lateWindowMs = LIVE_LOG_LATE_WINDOW_MS) => {
++    if (!checkpoint) {
++        return undefined;
++    }
++    return checkpoint.time && lateWindowMs > 0 ? shiftLiveLogTime(checkpoint.time, -lateWindowMs) : checkpoint.time;
++};
++
 +export const checkpointFor = (rows: LiveLogRow[]): LiveLogCheckpoint => ({
 +    time: rows[0]?.time || '',
 +    keys: rows.filter((row) => compareTimes(row.time, rows[0].time) === 0).map((row) => row.liveKey!),
@@ -3065,11 +3302,13 @@ index 0000000..a1a45ca
 +);
 +
 +/**
-+ * Establish a null baseline with one fetch, otherwise catch up until every checkpoint head key is found.
++ * Establish a null baseline with one fetch. Otherwise read back until every checkpoint head key is found
++ * and the late-arrival window behind the checkpoint has been re-read.
 + * Short or empty filtered pages can still have a progressing cursor. Only oldest === '' proves exhaustion.
-+ * Timestamp-only pagination cannot prove continuity for duplicate frontier identities or a full page whose
-+ * final two rows share its cursor timestamp; those cases conservatively report a gap, even with overlap.
-+ * No checkpoint is mutated. Budgets bound the work between requests; the caller owns request deadlines.
++ * A full page whose final rows share its cursor timestamp may hide more rows at that timestamp, because
++ * older_than is exclusive; that case conservatively reports a gap. Rows are merged by occurrence key, so
++ * overlapping reads are not duplicated. No checkpoint is mutated. Budgets bound the work between requests;
++ * the caller owns request deadlines.
 + */
 +export const recoverLiveLogs = async (
 +    fetchPage: LiveLogPageFetcher,
@@ -3080,9 +3319,13 @@ index 0000000..a1a45ca
 +    const started = now();
 +    const maxPages = Math.floor(boundedOption(options.maxPages, LIVE_LOG_RECOVERY_MAX_PAGES, 1));
 +    const maxDuration = boundedOption(options.maxDurationMs, LIVE_LOG_RECOVERY_MAX_DURATION_MS, 0);
++    const lateWindow = boundedOption(options.lateWindowMs, LIVE_LOG_LATE_WINDOW_MS, 0);
++    const windowStart = liveLogWindowStart(checkpoint, lateWindow);
 +    const merged = new Map<string, LiveLogRow>();
 +    const found = new Set<string>();
 +    const cursors = new Set<string>();
++    let windowCovered = lateWindow === 0;
++    let caughtUp = false;
 +    let ambiguity: string | undefined;
 +
 +    const assertCurrent = () => {
@@ -3100,6 +3343,14 @@ index 0000000..a1a45ca
 +            ...(reason ? { reason } : {}),
 +        };
 +    };
++
++    // A flush can hide even the checkpoint row for a moment. With the late window, the next cycle
++    // re-reads it, so keep the old checkpoint for one retry before reporting it missing.
++    const missing = (): LiveLogRecoveryResult => (
++        ambiguity || lateWindow === 0 || checkpoint!.retry
++            ? result(ambiguity || 'checkpoint-missing')
++            : { ...result(), checkpoint: { ...checkpoint!, retry: true } }
++    );
 +
 +    let olderThan: string | undefined;
 +    // A fixed iteration bound prevents runaway scans, including empty filtered pages.
@@ -3160,25 +3411,26 @@ index 0000000..a1a45ca
 +        if (checkpoint.limited) {
 +            return result('unverified-boundary');
 +        }
++        let allFound = false;
 +        if (checkpoint.time) {
-+            const frontier = rows.filter((row) => compareTimes(row.time, checkpoint.time) === 0);
-+            frontier.forEach((row) => found.add(row.liveKey!));
-+            const identities = frontier.map(queryIdentity);
-+            const checkpointIdentities = checkpoint.keys.map((key) => key.replace(/:\d+$/, ''));
-+            if (frontier.length && (new Set(identities).size < identities.length
-+                || new Set(checkpointIdentities).size < checkpointIdentities.length)) {
-+                ambiguity = ambiguity || 'ambiguous-frontier';
++            rows.filter((row) => compareTimes(row.time, checkpoint.time) === 0)
++                .forEach((row) => found.add(row.liveKey!));
++            allFound = checkpoint.keys.length > 0 && checkpoint.keys.every((key) => found.has(key));
++            const behind = [...merged.values()].filter((row) => compareTimes(row.time, checkpoint.time) < 0).length;
++            if (behind >= LIVE_LOG_LATE_WINDOW_ROWS || rows.some((row) => compareTimes(row.time, windowStart!) < 0)
++                || page.oldest === '' || compareTimes(page.oldest, windowStart!) < 0) {
++                windowCovered = true;
 +            }
-+            if (checkpoint.keys.length && checkpoint.keys.every((key) => found.has(key))) {
++            if (allFound && windowCovered) {
 +                return result(ambiguity);
 +            }
-+            if (rows.some((row) => compareTimes(row.time, checkpoint.time) < 0)
-+                || (page.oldest && compareTimes(page.oldest, checkpoint.time) < 0)) {
-+                return result(ambiguity || 'checkpoint-missing');
++            if (!allFound && (rows.some((row) => compareTimes(row.time, checkpoint.time) < 0)
++                || (page.oldest && compareTimes(page.oldest, checkpoint.time) < 0))) {
++                return missing();
 +            }
 +        }
 +        if (page.oldest === '') {
-+            return result(ambiguity || (checkpoint.time ? 'checkpoint-missing' : undefined));
++            return checkpoint.time && !allFound ? missing() : result(ambiguity);
 +        }
 +        if (pageNumber >= maxPages) {
 +            return result(ambiguity || 'page-budget');
@@ -3186,7 +3438,9 @@ index 0000000..a1a45ca
 +        if (now() - started >= maxDuration) {
 +            return result(ambiguity || 'time-budget');
 +        }
-+        if (pageNumber === 1) {
++        // Re-reading the late window after overlap is routine and should not flash "Catching up".
++        if (!caughtUp && !allFound) {
++            caughtUp = true;
 +            options.onCatchUp?.();
 +        }
 +        assertCurrent();

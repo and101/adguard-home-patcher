@@ -33,16 +33,17 @@ On failure the script writes a short reason to `dist/REASON`.
 
 `scripts/tests/querylog-real-api.cjs` starts the official binary with a throwaway config in a temp directory. Everything binds to `127.0.0.1` on random high ports, so it doesn't need root and never touches port 53 or the host's DNS. Upstream resolvers point at a local trap that fails the test if anything tries to leave the box, and filtering lists, update checks and similar features are switched off.
 
-The test sends 1,352 real DNS queries and checks that:
+The test sends a few thousand real DNS queries and checks that:
 
 - cursor pagination via `older_than` returns every record once, newest first;
 - the frontend's catch-up helper (the actual bundled code, not a copy) recovers a burst within its page budget, and reports a gap and rebases when the budget is exceeded;
 - server-side filters are carried through every recovery request;
+- polling continuously while 1,200 queries stream in, with the 64-entry memory buffer flushing to disk throughout, observes every query with no gap. The same run with the late-arrival window disabled is logged for comparison;
 - no records are modified by the process.
 
 With `BROWSER_TEST=1` the same server is also driven from the production UI in Chromium. The browser's network guard blocks external origins and the server's "clear log" endpoint.
 
-Some things can't be tested this way: exact nanosecond timestamp ties can't be forced through the real binary (unit tests cover them), and AdGuard Home's file scan stops after 50,000 candidates, so sparse filters can return empty pages with a continuation cursor. See [API limits](live-query-log-controls.md#api-limits).
+Some things can't be tested this way: exact nanosecond timestamp ties can't be forced through the real binary (unit tests cover them), and AdGuard Home's file scan stops after 50,000 candidates, so sparse filters can return empty pages with a continuation cursor. See [what can still be missed](live-query-log-controls.md#what-can-still-be-missed).
 
 ## Release identities
 

@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { createRequire } = require('node:module');
+const { setTimeout: delay } = require('node:timers/promises');
 const { withOfficialServer, loadProductionRecovery, waitFor } = require('./querylog-real-api-helpers.cjs');
 
 const source = path.resolve(process.argv[2]);
@@ -13,7 +14,12 @@ async function check(environment) {
     const { base, marker, request, sendQueries, directory } = environment;
     const production = await loadProductionRecovery(source, directory);
     const { recoverLiveLogs, compareTimes, normalizeLogs, LIVE_LOG_RECOVERY_MAX_PAGES,
-        LIVE_LOG_RECOVERY_MAX_DURATION_MS } = production;
+        LIVE_LOG_RECOVERY_MAX_DURATION_MS, LIVE_LOG_LATE_WINDOW_ROWS } = production;
+    const budgetRows = LIVE_LOG_RECOVERY_MAX_PAGES * 100;
+    // AdGuard Home's file search seeks the exact stored timestamp given as older_than, so the helper
+    // must only send cursors the server returned. A synthetic cursor silently skips file-backed rows.
+    const serverCursor = (returned, cursor) => assert.ok(cursor === undefined || returned.has(cursor),
+        `Recovery sent a cursor the server never returned: ${cursor}`);
     const names = rows => rows.map(row => row.question.name.replace(/\.$/, ''));
     const ordered = rows => {
         for (let index = 1; index < rows.length; index += 1) {
@@ -49,7 +55,7 @@ async function check(environment) {
         const pages = [];
         const rows = [];
         let cursor;
-        for (let index = 0; index < 20; index += 1) {
+        for (let index = 0; index < 40; index += 1) {
             const page = await queryPage(search, cursor, undefined, responseStatus);
             pages.push({ size: page.data.length, requested: cursor, oldest: page.oldest });
             rows.push(...page.data);
@@ -61,7 +67,7 @@ async function check(environment) {
             // Preserve the server's complete RFC3339Nano string without Date/ISO conversion.
             cursor = page.oldest;
         }
-        assert.fail(`Real API did not exhaust within 20 pages: ${JSON.stringify(pages)}`);
+        assert.fail(`Real API did not exhaust within 40 pages: ${JSON.stringify(pages)}`);
     };
     const expectDomains = (rows, expected) => {
         const actual = new Set(names(rows));
@@ -79,9 +85,12 @@ async function check(environment) {
         const calls = [];
         const original = structuredClone(checkpoint);
         const signal = AbortSignal.timeout(LIVE_LOG_RECOVERY_MAX_DURATION_MS);
+        const returned = new Set();
         const result = await recoverLiveLogs(async cursor => {
             calls.push(cursor);
+            serverCursor(returned, cursor);
             const page = await queryPage(marker, cursor, signal, responseStatus);
+            returned.add(page.oldest);
             return { logs: normalizeLogs(page.data), oldest: page.oldest };
         }, checkpoint, { ...options, signal });
         assert.equal(result.error, undefined, `Recovery API error: ${result.error}`);
@@ -198,28 +207,29 @@ async function check(environment) {
 
         const caughtUp = await recovery(checkpoint);
         assert.equal(caughtUp.result.gap, false, `Unexpected recovery gap: ${caughtUp.result.reason}`);
-        assert.equal(caughtUp.calls.length, 3);
-        assert.deepEqual(caughtUp.calls, [undefined, normal.pages[0].oldest, normal.pages[1].oldest]);
+        // The third page holds the anchor. Nothing older exists for this marker, so the late-arrival
+        // window is only covered by reading on to the empty final page.
+        assert.deepEqual(caughtUp.calls, normal.pages.map(item => item.requested));
         assert.deepEqual(caughtUp.result.logs.map(row => row.domain), [...burst].reverse().concat(anchor));
         assert.equal(new Set(caughtUp.result.logs.map(row => row.liveKey)).size, 252);
         assert.equal(caughtUp.result.checkpoint.time, normal.rows[0].time);
         assert.notEqual(caughtUp.result.checkpoint.time, checkpoint.time);
-        console.log('Production recovery: 251/251 new queries + previous checkpoint, 3 pages, ordered/deduplicated, no gap');
+        console.log('Production recovery: 251/251 new queries + previous checkpoint, 4 pages, ordered/deduplicated, no gap');
 
         const filteredCatchUp = await recovery(rewrittenBaseline.result.checkpoint, {}, 'rewritten');
         assert.deepEqual(filteredCatchUp, caughtUp, 'Production catch-up must preserve the effective status filter');
         console.log('Real status filters: rewritten -> 100,100,51,0; blocked -> 0; filtered recovery -> 251/251');
 
-        // Reuse the proven three-page dataset to test a deliberately smaller
-        // recovery budget, independently of the later production-budget overflow.
-        const reducedBudget = await recovery(checkpoint, { maxPages: 2 });
+        // Reuse the same dataset to test a deliberately smaller recovery budget, independently of the
+        // later production-budget overflow. The late window is off so only the budget is exercised.
+        const reducedBudget = await recovery(checkpoint, { maxPages: 2, lateWindowMs: 0 });
         assert.deepEqual(reducedBudget.calls, caughtUp.calls.slice(0, 2));
         assert.equal(reducedBudget.result.reason, 'page-budget');
         assert.equal(reducedBudget.result.gap, true, 'A missing checkpoint must never claim continuity');
         assert.deepEqual(reducedBudget.result.logs.map(row => row.domain), [...burst].reverse().slice(0, 200));
         assert.deepEqual(reducedBudget.result.checkpoint, caughtUp.result.checkpoint,
             'Incomplete recovery must rebase to the newest observed checkpoint');
-        const reducedRebase = await recovery(reducedBudget.result.checkpoint, { maxPages: 2 });
+        const reducedRebase = await recovery(reducedBudget.result.checkpoint, { maxPages: 2, lateWindowMs: 0 });
         assert.equal(reducedRebase.calls.length, 1, 'Reduced-budget gap must not repeat historical backfill');
         assert.equal(reducedRebase.result.gap, false);
         assert.deepEqual(reducedRebase.result.checkpoint, reducedBudget.result.checkpoint);
@@ -231,21 +241,23 @@ async function check(environment) {
             await page.clock.runFor(1000);
             await expect(syncStatus).toHaveText('Live / Synced');
             await expect(page.getByTestId('querylog_cell')).toHaveCount(252);
-            assert.equal(uiRequests.length - start, 3);
+            assert.equal(uiRequests.length - start, 4);
         }
 
-        const overflow = Array.from({ length: 1100 }, (_, index) =>
+        const overflow = Array.from({ length: budgetRows + 120 }, (_, index) =>
             `overflow-${String(index + 1).padStart(4, '0')}.${marker}`);
         await sendQueries(overflow);
         const expected = [anchor, ...burst, ...overflow];
         const beforeGap = await awaitRecords(expected);
         const limited = await recovery(caughtUp.result.checkpoint);
         assert.equal(limited.calls.length, LIVE_LOG_RECOVERY_MAX_PAGES);
-        assert.equal(limited.result.logs.length, 1000);
+        assert.equal(limited.result.logs.length, budgetRows);
         assert.equal(limited.result.gap, true);
         assert.equal(limited.result.reason, 'page-budget');
         const next = await recovery(limited.result.checkpoint);
-        assert.equal(next.calls.length, 1, 'Rebased polling must not repeat ten historical requests');
+        // The checkpoint is on the first page; only the bounded late window is re-read behind it.
+        const windowPages = Math.ceil((LIVE_LOG_LATE_WINDOW_ROWS + 1) / 100) + 1;
+        assert.ok(next.calls.length <= windowPages, `Rebased polling read ${next.calls.length} pages`);
         assert.equal(next.result.gap, false, 'New overlap is observable; prior gap remains a lifecycle/UI warning');
         if (page) {
             const { expect } = createRequire(path.join(source, 'client/package.json'))('@playwright/test');
@@ -270,8 +282,11 @@ async function check(environment) {
             assert.equal(response.status(), 200, 'Rebased UI poll must succeed');
             assert.equal(await response.finished(), null, 'Rebased UI response must finish successfully');
             await expect(syncStatus).toHaveText('Gap detected — some queries may not have been recovered.');
-            assert.equal(uiRequests.length - rebaseStart, 1, 'Completed rebased UI cycle must fetch only the head');
-            console.log('Real-API production UI: Synced after 251 arrivals; sticky Gap after 10-page overflow; next poll 1 page');
+            const rebaseRequests = uiRequests.length - rebaseStart;
+            assert.ok(rebaseRequests >= 1 && rebaseRequests <= windowPages,
+                `Completed rebased UI cycle must not repeat the backfill (${rebaseRequests} requests)`);
+            console.log('Real-API production UI: Synced after 251 arrivals; sticky Gap after budget overflow; '
+                + `rebased poll ${rebaseRequests} page(s)`);
         } else {
             console.log('Real-API browser scenario not requested (BROWSER_TEST != 1); DNS/API/helper checks executed');
         }
@@ -282,7 +297,53 @@ async function check(environment) {
         assert.deepEqual(afterGap.rows.map(row => [row.question.name, row.time]),
             beforeGap.rows.map(row => [row.question.name, row.time]), 'Recovery must leave server history unchanged');
         console.log(`Real DNS integration passed: ${expected.length}/${expected.length} genuine queries verified; `
-            + '10-page budget -> explicit gap -> 1-page rebase; server history unchanged');
+            + 'page budget -> explicit gap -> bounded rebase; server history unchanged');
+
+        // Poll continuously with the production helper while queries arrive and the 64-entry memory
+        // buffer is flushed to disk again and again. Every query must be observed, with no gap.
+        const stream = async (label, lateWindowMs) => {
+            const search = `${label}.stream.${marker}`;
+            const domains = Array.from({ length: 1200 }, (_, index) => `q-${String(index + 1).padStart(4, '0')}.${search}`);
+            const seen = new Set();
+            const gaps = [];
+            let current = null;
+            let polls = 0;
+            const poll = async () => {
+                const returned = new Set();
+                const result = await recoverLiveLogs(async cursor => {
+                    serverCursor(returned, cursor);
+                    const response = await queryPage(search, cursor);
+                    returned.add(response.oldest);
+                    return { logs: normalizeLogs(response.data), oldest: response.oldest };
+                }, current, { lateWindowMs });
+                assert.equal(result.error, undefined, `Streaming recovery API error: ${result.error}`);
+                if (result.gap) gaps.push(result.reason);
+                result.logs.forEach(row => seen.add(row.domain));
+                current = result.checkpoint;
+                polls += 1;
+            };
+            await poll();
+            let sending = true;
+            const sender = sendQueries(domains).finally(() => { sending = false; });
+            while (sending) {
+                await poll();
+                await delay(2);
+            }
+            await sender;
+            await waitFor(`${domains.length} streamed records`, async () => {
+                const all = await collect(search);
+                assert.equal(all.rows.length, domains.length);
+            });
+            await poll();
+            return { missing: domains.filter(domain => !seen.has(domain)), gaps, polls };
+        };
+        const withoutWindow = await stream('plain', 0);
+        console.log(`Streaming without late window: ${withoutWindow.missing.length} missed, `
+            + `gaps ${JSON.stringify(withoutWindow.gaps)}, ${withoutWindow.polls} polls (informational)`);
+        const withWindow = await stream('late', undefined);
+        assert.deepEqual(withWindow.missing, [], 'Live polling missed queries');
+        assert.deepEqual(withWindow.gaps, [], 'Live polling reported a gap during steady traffic');
+        console.log(`Streaming with production late window: 1200/1200 observed, no gap, ${withWindow.polls} polls`);
     } catch (error) {
         if (page) console.error('Real-API browser diagnostics:', {
             url: page.url(), body: (await page.locator('body').textContent()).slice(0, 4000), uiRequests, uiViolations, uiErrors,

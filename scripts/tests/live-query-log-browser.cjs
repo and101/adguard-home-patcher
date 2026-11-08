@@ -33,6 +33,7 @@ async function check(browser, viewport) {
     let failNextLive = false;
     let failNextCursor = false;
     let heldLive;
+    let queryLogInFlight = 0;
     let liveInFlight = 0;
     let maxLiveInFlight = 0;
     let serverClears = 0;
@@ -90,6 +91,7 @@ async function check(browser, viewport) {
             requests.push(params);
             const live = params.limit === '100';
             if (live) maxLiveInFlight = Math.max(maxLiveInFlight, ++liveInFlight);
+            queryLogInFlight += 1;
             try {
                 if (live && (failNextLive || (failNextCursor && params.older_than))) {
                     failNextLive = false;
@@ -111,6 +113,7 @@ async function check(browser, viewport) {
                 return await route.fulfill({ json: body });
             } finally {
                 if (live) liveInFlight -= 1;
+                queryLogInFlight -= 1;
             }
         } else if (endpoint === 'querylog_clear') {
             serverClears += 1;
@@ -181,8 +184,20 @@ async function check(browser, viewport) {
             else element.setAttribute('data-theme', value);
         }, originalTheme);
     };
-    const liveCount = () => page.evaluate(() => window.queryAudit.filter(url =>
-        new URL(url, location.href).searchParams.get('limit') === '100').length);
+    // Counts Live cycles: each starts with a head request; window re-reads add older_than requests.
+    const liveCount = () => page.evaluate(() => window.queryAudit.filter(url => {
+        const params = new URL(url, location.href).searchParams;
+        return params.get('limit') === '100' && !params.has('older_than');
+    }).length);
+    // A Live cycle chains its page requests without timers; networkidle can resolve between them.
+    // Wait until every Query Log request has been answered and no further request follows.
+    const settle = async () => {
+        for (;;) {
+            const seen = requests.length;
+            await new Promise(resolve => setTimeout(resolve, 250));
+            if (requests.length === seen && queryLogInFlight <= (heldLive?.seen ? 1 : 0)) return;
+        }
+    };
     const tick = async (ms = 1200) => {
         await page.clock.runFor(ms);
         // Fetch dispatch and Node's route callback cross a transport boundary. An already
@@ -190,6 +205,7 @@ async function check(browser, viewport) {
         const sent = await page.evaluate(() => window.queryAudit.length);
         await expect.poll(() => requests.length - queryEpochStart).toBeGreaterThanOrEqual(sent);
         await page.waitForLoadState('networkidle');
+        await settle();
     };
     const nextPoll = async () => {
         const before = await liveCount();
@@ -251,14 +267,16 @@ async function check(browser, viewport) {
         assert.deepEqual(await renderedDomains(), added.map(row => row.question.name),
             'Recovered rows are newest first, complete, and contain no duplicates');
     };
-    const assertPages = async (requestStart, responseStart, count) => {
+    // The late-arrival window re-reads at most 500 rows behind the checkpoint.
+    const windowPages = Math.ceil(500 / 100) + 1;
+    const assertPages = async (requestStart, responseStart, minimum) => {
         // Route completion and React's cycle commit happen after browser fetch dispatch.
-        await expect.poll(() => requests.length - requestStart).toBe(count);
-        await expect.poll(() => responses.length - responseStart).toBe(count);
+        await page.waitForLoadState('networkidle');
+        await expect.poll(() => responses.length - responseStart).toBe(requests.length - requestStart);
         const actual = requests.slice(requestStart);
         const pages = responses.slice(responseStart);
-        assert.equal(actual.length, count, 'Recovery stops as soon as the newest checkpoint group overlaps');
-        assert.equal(pages.length, count);
+        assert.ok(actual.length >= minimum && actual.length <= minimum + windowPages,
+            `Recovery reads the checkpoint plus a bounded late window (${actual.length} pages, minimum ${minimum})`);
         assert.equal(actual[0].older_than, undefined, 'Each cycle starts at the newest page');
         actual.forEach((params, index) => {
             assert.equal(params.limit, '100');
@@ -557,13 +575,14 @@ async function check(browser, viewport) {
         await expectNewest(afterClear);
         await clearLocalView();
 
-        // The ten-page budget is bounded, leaves a sticky warning, and rebases to the newest page.
+        // The twenty-page budget is bounded, leaves a sticky warning, and rebases to the newest page.
         const gapToasts = await page.evaluate(() => window.errorToastCount);
-        const overflow = arrive(1200);
+        const overflow = arrive(2100);
         const overflowRequestStart = requests.length;
         const overflowResponseStart = responses.length;
         await nextPoll();
-        await assertPages(overflowRequestStart, overflowResponseStart, 10);
+        await assertPages(overflowRequestStart, overflowResponseStart, 20);
+        assert.equal(requests.length - overflowRequestStart, 20, 'Recovery stops at the page budget');
         await expect(syncStatus).toHaveText(gapText);
         await expectNewest(overflow.slice(0, 500));
         await checkControls(true); // Also exercise the long gap text at 320/390px in both themes.
@@ -664,7 +683,7 @@ async function check(browser, viewport) {
         assert.equal(await liveCount(), leavingCount);
         assert.equal(serverClears, 0);
         assert.deepEqual(errors, []);
-        console.log(`${viewport.width}x${viewport.height}: light/dark controls, sync states, cursor recovery (1/99/100/250/500/1200), caps/pending, pause/visibility/offline catch-up, outage deduplication, clear races, sticky gap/rebaseline, filters, paused pagination and unmount passed`);
+        console.log(`${viewport.width}x${viewport.height}: light/dark controls, sync states, cursor recovery (1/99/100/250/500/2100), caps/pending, pause/visibility/offline catch-up, outage deduplication, clear races, sticky gap/rebaseline, filters, paused pagination and unmount passed`);
     } catch (error) {
         console.error('Browser diagnostics:', {
             viewport, errors, visibility: await page.evaluate(() => document.visibilityState),
