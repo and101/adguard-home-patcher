@@ -220,6 +220,16 @@ async function check(environment) {
         await expect(page.getByRole('option', { name: 'Last 30 days', exact: true })).toHaveCount(0);
         await page.keyboard.press('Escape');
 
+        // Queries and blocked queries share one chart at every width.
+        const chart = page.getByTestId('dashboard-queries-chart');
+        await expect(chart).toBeVisible();
+        await expect(chart.locator('canvas')).toBeVisible();
+        const chartBox = await chart.boundingBox();
+        assert.ok(chartBox.width <= viewport.width && chartBox.height >= 150, `${name}: queries chart size`);
+        await chart.locator('canvas').hover();
+        await expect(chart.getByText('Blocked', { exact: true }).last()).toBeVisible();
+        await shot('dashboard-chart');
+
         await choose('Last 1 hour');
         await waitFor('1-hour stats request', async () => assert.equal(statsRecent().at(-1), String(HOUR)));
         await expect(period).toContainText('Last 1 hour');

@@ -821,6 +821,41 @@ index 0000000000000000000000000000000000000000..9037630d4f9115cdf5449aa09b9b052e
 +        expect(result.reason).toBe('page-budget');
 +    });
 +});
+diff --git a/client_v2/src/__tests__/queriesChart.test.ts b/client_v2/src/__tests__/queriesChart.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..57ac029de6d33e343c931d410ceb9691eb57401a
+--- /dev/null
++++ b/client_v2/src/__tests__/queriesChart.test.ts
+@@ -0,0 +1,29 @@
++import { describe, expect, it } from 'vitest';
++
++import {
++    padHistory,
++    sumBlocked,
++} from 'panel/components/Dashboard/blocks/QueriesChart/QueriesChart';
++
++describe('combined queries chart', () => {
++    it('adds filtering, safe browsing and parental blocks per bucket', () => {
++        expect(sumBlocked([1, 2, 3], [0, 1], [1, 0, 1])).toEqual([2, 3, 4]);
++        expect(sumBlocked([], [], [])).toEqual([]);
++    });
++
++    it('keeps multi-bucket series and labels every point', () => {
++        const result = padHistory([5, 7, 9], [1, 2, 3], 'hours');
++        expect(result.queries).toEqual([5, 7, 9]);
++        expect(result.blocked).toEqual([1, 2, 3]);
++        expect(result.labels).toHaveLength(3);
++        expect(new Set(result.labels).size).toBe(3);
++    });
++
++    it('draws a single bucket flat with one label and empty data as zero', () => {
++        const single = padHistory([47], [4], 'hours');
++        expect(single.queries).toEqual([47, 47]);
++        expect(single.blocked).toEqual([4, 4]);
++        expect(single.labels[0]).toBe(single.labels[1]);
++        expect(padHistory([], [], 'hours').queries).toEqual([0, 0]);
++    });
++});
 diff --git a/client_v2/src/__tests__/queryLogLiveStore.test.ts b/client_v2/src/__tests__/queryLogLiveStore.test.ts
 new file mode 100644
 index 0000000000000000000000000000000000000000..9f4521f75fdd7268db4aed9008f3ab4bd2c37f49
@@ -1408,7 +1443,7 @@ index 0000000000000000000000000000000000000000..6e52d40446c5523b05b0777794310fc8
 +    });
 +});
 diff --git a/client_v2/src/components/Dashboard/Dashboard.tsx b/client_v2/src/components/Dashboard/Dashboard.tsx
-index 22f6336294255ffcea3293419c96d3cd1a37e627..96e355cd4cb9bf43dcb10dad09522160a7cc26ef 100644
+index 22f6336294255ffcea3293419c96d3cd1a37e627..b0d7e65ab9230c0695bb82b6a5004a949e5ea489 100644
 --- a/client_v2/src/components/Dashboard/Dashboard.tsx
 +++ b/client_v2/src/components/Dashboard/Dashboard.tsx
 @@ -14,7 +14,16 @@ import { statsState, getStats, getStatsConfig, enableStatistics } from 'panel/st
@@ -1429,11 +1464,12 @@ index 22f6336294255ffcea3293419c96d3cd1a37e627..96e355cd4cb9bf43dcb10dad09522160
  
  import { Header, getPeriodLabel } from './blocks/Header/Header';
  import { StatCards } from './blocks/StatCards';
-@@ -25,12 +34,18 @@ import { TopQueriedDomains } from './blocks/TopQueriedDomains';
+@@ -25,12 +34,19 @@ import { TopQueriedDomains } from './blocks/TopQueriedDomains';
  import { TopBlockedDomains } from './blocks/TopBlockedDomains';
  import { TopUpstreams } from './blocks/TopUpstreams';
  import { UpstreamAvgTime } from './blocks/UpstreamAvgTime';
 +import { CustomPeriod } from './blocks/CustomPeriod';
++import { QueriesChart } from './blocks/QueriesChart';
  
  import s from './Dashboard.module.pcss';
  
@@ -1448,7 +1484,7 @@ index 22f6336294255ffcea3293419c96d3cd1a37e627..96e355cd4cb9bf43dcb10dad09522160
      let timerRef: ReturnType<typeof setInterval> | null = null;
  
      const startCountdown = (duration: number) => {
-@@ -70,7 +85,12 @@ export const Dashboard = () => {
+@@ -70,7 +86,12 @@ export const Dashboard = () => {
  
      const periodOptions = createMemo(() => {
          const max = maxStatsInterval();
@@ -1462,7 +1498,7 @@ index 22f6336294255ffcea3293419c96d3cd1a37e627..96e355cd4cb9bf43dcb10dad09522160
  
          if (!intervals.includes(max)) {
              intervals.push(max);
-@@ -91,7 +111,19 @@ export const Dashboard = () => {
+@@ -91,7 +112,19 @@ export const Dashboard = () => {
  
      const effectivePeriod = createMemo(() => {
          const options = periodOptions();
@@ -1483,7 +1519,7 @@ index 22f6336294255ffcea3293419c96d3cd1a37e627..96e355cd4cb9bf43dcb10dad09522160
      });
  
      onMount(() => {
-@@ -101,7 +133,7 @@ export const Dashboard = () => {
+@@ -101,7 +134,7 @@ export const Dashboard = () => {
      });
  
      createEffect(() => {
@@ -1492,7 +1528,7 @@ index 22f6336294255ffcea3293419c96d3cd1a37e627..96e355cd4cb9bf43dcb10dad09522160
          // No stats request before the first config attempt settles: it would
          // be clamped by the default DAY and paint 24h values before the real
          // ones.  Tracks `selectedPeriod` only; the interval/configLoaded
-@@ -117,7 +149,13 @@ export const Dashboard = () => {
+@@ -117,7 +150,13 @@ export const Dashboard = () => {
          getClients();
          getAccessList();
          getStatsConfig();
@@ -1507,7 +1543,7 @@ index 22f6336294255ffcea3293419c96d3cd1a37e627..96e355cd4cb9bf43dcb10dad09522160
      };
  
      const handleToggleProtection = (enabled: boolean, duration?: number) => {
-@@ -130,6 +168,19 @@ export const Dashboard = () => {
+@@ -130,6 +169,19 @@ export const Dashboard = () => {
      };
  
      const handlePeriodChange = (period: number) => {
@@ -1527,7 +1563,7 @@ index 22f6336294255ffcea3293419c96d3cd1a37e627..96e355cd4cb9bf43dcb10dad09522160
          setSelectedPeriod(period);
          LocalStorageHelper.setItem(LOCAL_STORAGE_KEYS.STATS_PERIOD, period);
      };
-@@ -149,14 +200,23 @@ export const Dashboard = () => {
+@@ -149,14 +201,23 @@ export const Dashboard = () => {
                      protectionEnabled={!!dashboardState.protectionEnabled}
                      processingProtection={dashboardState.processingProtection}
                      remainingTime={remainingTime()}
@@ -1553,6 +1589,21 @@ index 22f6336294255ffcea3293419c96d3cd1a37e627..96e355cd4cb9bf43dcb10dad09522160
                  <Show
                      when={!isInitialLoading()}
                      fallback={
+@@ -177,6 +238,14 @@ export const Dashboard = () => {
+                         timeUnits={statsState.timeUnits}
+                     />
+ 
++                    <QueriesChart
++                        dnsQueries={statsState.dnsQueries}
++                        blockedFiltering={statsState.blockedFiltering}
++                        replacedSafebrowsing={statsState.replacedSafebrowsing}
++                        replacedParental={statsState.replacedParental}
++                        timeUnits={statsState.timeUnits}
++                    />
++
+                     <Show
+                         when={statsState.enabled}
+                         fallback={
 diff --git a/client_v2/src/components/Dashboard/blocks/CustomPeriod/CustomPeriod.module.pcss b/client_v2/src/components/Dashboard/blocks/CustomPeriod/CustomPeriod.module.pcss
 new file mode 100644
 index 0000000000000000000000000000000000000000..cf4270682f4251d3cb25814d5619a54b75cf3ded
@@ -1728,6 +1779,316 @@ index 0000000000000000000000000000000000000000..1f3484e65d939e8eaa9c4d94a3768501
 +++ b/client_v2/src/components/Dashboard/blocks/CustomPeriod/index.ts
 @@ -0,0 +1 @@
 +export { CustomPeriod } from './CustomPeriod';
+diff --git a/client_v2/src/components/Dashboard/blocks/QueriesChart/QueriesChart.module.pcss b/client_v2/src/components/Dashboard/blocks/QueriesChart/QueriesChart.module.pcss
+new file mode 100644
+index 0000000000000000000000000000000000000000..61feafda87f6200c5eb14a515a4b2abccc4006fd
+--- /dev/null
++++ b/client_v2/src/components/Dashboard/blocks/QueriesChart/QueriesChart.module.pcss
+@@ -0,0 +1,96 @@
++.card {
++    display: flex;
++    flex-direction: column;
++    gap: 12px;
++    margin: 0 16px 32px;
++    padding: 16px;
++    border: 1px solid var(--default-item-divider);
++    border-radius: 8px;
++    background: var(--default-cards-background);
++
++    @media (min-width: 1024px) {
++        gap: 16px;
++        margin: 0 0 32px;
++        padding: 24px;
++    }
++}
++
++.header {
++    display: flex;
++    flex-wrap: wrap;
++    align-items: center;
++    justify-content: space-between;
++    gap: 8px 16px;
++}
++
++.title {
++    margin: 0;
++}
++
++.legend {
++    display: flex;
++    gap: 16px;
++    color: var(--default-description-text);
++}
++
++.legendItem {
++    display: inline-flex;
++    align-items: center;
++    gap: 6px;
++}
++
++.dot {
++    display: inline-block;
++    flex-shrink: 0;
++    width: 8px;
++    height: 8px;
++    border-radius: 50%;
++}
++
++.chart {
++    position: relative;
++    height: 160px;
++
++    @media (min-width: 768px) {
++        height: 200px;
++    }
++
++    @media (min-width: 1024px) {
++        height: 220px;
++    }
++}
++
++.tooltip {
++    position: absolute;
++    z-index: 2;
++    display: flex;
++    flex-direction: column;
++    gap: 4px;
++    padding: 8px 10px;
++    font-size: 12px;
++    line-height: 16px;
++    white-space: nowrap;
++    color: var(--default-main-text);
++    background: var(--default-cards-background);
++    border: 1px solid var(--default-item-divider);
++    border-radius: 4px;
++    box-shadow: var(--default-cards-box-shadow);
++    opacity: 0;
++    pointer-events: none;
++}
++
++.tooltipRow {
++    display: flex;
++    align-items: center;
++    gap: 6px;
++}
++
++.tooltipValue {
++    margin-left: auto;
++    padding-left: 12px;
++    font-weight: var(--weight-semi-bold);
++}
++
++.tooltipDate {
++    color: var(--default-description-text);
++}
+diff --git a/client_v2/src/components/Dashboard/blocks/QueriesChart/QueriesChart.tsx b/client_v2/src/components/Dashboard/blocks/QueriesChart/QueriesChart.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..aa4cb2977cedf556713e3ea6d8f785c880632470
+--- /dev/null
++++ b/client_v2/src/components/Dashboard/blocks/QueriesChart/QueriesChart.tsx
+@@ -0,0 +1,195 @@
++import { createMemo, onCleanup, onMount, untrack } from 'solid-js';
++import cn from 'clsx';
++import {
++    CategoryScale,
++    Chart,
++    Filler,
++    LinearScale,
++    LineController,
++    LineElement,
++    PointElement,
++    Tooltip,
++    type ScriptableContext,
++} from 'chart.js';
++
++import intl from 'panel/common/intl';
++import theme from 'panel/lib/theme';
++import { formatNumber } from 'panel/helpers/helpers';
++import { formatHistoryLabel } from 'panel/helpers/lineUtils';
++import {
++    createCursorLinePlugin,
++    createExternalTooltipHandler,
++    useChart,
++} from 'panel/helpers/useChart';
++import { CARDS_COLORS } from '../StatCard/StatCard';
++
++import s from './QueriesChart.module.pcss';
++
++Chart.register(
++    LineController,
++    LineElement,
++    PointElement,
++    LinearScale,
++    CategoryScale,
++    Tooltip,
++    Filler,
++);
++
++const QUERIES_COLOR = '#4B8FD9';
++const BLOCKED_COLOR = CARDS_COLORS.ADS;
++
++type Props = {
++    dnsQueries: number[];
++    blockedFiltering: number[];
++    replacedSafebrowsing: number[];
++    replacedParental: number[];
++    timeUnits: string;
++};
++
++/** Everything the dashboard counts as blocked, per bucket. */
++export const sumBlocked = (...series: number[][]): number[] => {
++    const length = Math.max(0, ...series.map((values) => values.length));
++    return Array.from({ length }, (_, index) =>
++        series.reduce((total, values) => total + (values[index] || 0), 0),
++    );
++};
++
++/**
++ * Chart.js needs two points for a line.  A single bucket (e.g. the last hour)
++ * is drawn flat with the same label at both ends; no data becomes zero.
++ */
++export const padHistory = (queries: number[], blocked: number[], timeUnits: string) => {
++    const count = queries.length;
++    if (count >= 2) {
++        return {
++            queries,
++            blocked,
++            labels: queries.map((_, index) => formatHistoryLabel(index, count, timeUnits)),
++        };
++    }
++    const label = formatHistoryLabel(0, 1, timeUnits);
++    return {
++        queries: [queries[0] || 0, queries[0] || 0],
++        blocked: [blocked[0] || 0, blocked[0] || 0],
++        labels: [label, label],
++    };
++};
++
++const gradient = (color: string) => (context: ScriptableContext<'line'>) => {
++    const { ctx, height } = context.chart;
++    const fill = ctx.createLinearGradient(0, 0, 0, height || 200);
++    fill.addColorStop(0, `${color}66`);
++    fill.addColorStop(1, `${color}0D`);
++    return fill;
++};
++
++const dataset = (data: number[], color: string, label: string, order: number) => ({
++    label,
++    data,
++    order,
++    borderColor: color,
++    borderWidth: 1.5,
++    backgroundColor: gradient(color),
++    fill: 'origin' as const,
++    clip: false as const,
++    pointRadius: 0,
++    pointHoverRadius: 4,
++    pointHoverBackgroundColor: color,
++    tension: 0.4,
++});
++
++/** Queries and blocked queries overlaid on one time axis. */
++export const QueriesChart = (props: Props) => {
++    const series = createMemo(() =>
++        padHistory(
++            props.dnsQueries,
++            sumBlocked(props.blockedFiltering, props.replacedSafebrowsing, props.replacedParental),
++            props.timeUnits,
++        ),
++    );
++
++    const chartData = createMemo(() => {
++        const { queries, blocked, labels } = series();
++        // Blocked is drawn last so it stays visible in front of the queries area.
++        return {
++            labels,
++            datasets: [
++                dataset(blocked, BLOCKED_COLOR, intl.getMessage('blocked'), 0),
++                dataset(queries, QUERIES_COLOR, intl.getMessage('dns_queries'), 1),
++            ],
++        };
++    });
++
++    let tooltipEl!: HTMLDivElement;
++    const externalTooltipHandler = createExternalTooltipHandler(
++        () => tooltipEl,
++        (dataPoint) => {
++            const { queries, blocked, labels } = series();
++            const index = dataPoint.dataIndex;
++            const row = (color: string, label: string, value: number) =>
++                `<div class="${s.tooltipRow}"><span class="${s.dot}" style="background:${color}"></span>` +
++                `<span>${label}</span><span class="${s.tooltipValue}">${formatNumber(value)}</span></div>`;
++            return (
++                row(QUERIES_COLOR, intl.getMessage('dns_queries'), queries[index]) +
++                row(BLOCKED_COLOR, intl.getMessage('blocked'), blocked[index]) +
++                `<div class="${s.tooltipDate}">${labels[index]}</div>`
++            );
++        },
++    );
++
++    const chartOptions = createMemo(() => ({
++        responsive: true,
++        maintainAspectRatio: false,
++        animation: false as const,
++        layout: { padding: { top: 8, bottom: 4, left: 4, right: 4 } },
++        plugins: {
++            tooltip: { enabled: false, external: externalTooltipHandler },
++            legend: { display: false },
++        },
++        scales: {
++            x: { display: false },
++            y: { display: false, min: 0 },
++        },
++        interaction: { intersect: false, mode: 'index' as const },
++    }));
++
++    const { setCanvasRef, hideTooltip } = untrack(() =>
++        useChart(chartData, chartOptions, [createCursorLinePlugin(QUERIES_COLOR)]),
++    );
++
++    // Chart.js keeps tooltips open after a tap; close them on taps elsewhere.
++    onMount(() => {
++        const onPointerDown = (event: PointerEvent) => {
++            if (
++                tooltipEl?.style.opacity === '1' &&
++                !tooltipEl.parentElement?.contains(event.target as Node)
++            ) {
++                hideTooltip();
++            }
++        };
++        document.addEventListener('pointerdown', onPointerDown, true);
++        onCleanup(() => document.removeEventListener('pointerdown', onPointerDown, true));
++    });
++
++    return (
++        <section class={s.card} data-testid="dashboard-queries-chart">
++            <div class={s.header}>
++                <h2 class={cn(theme.title.h5, s.title)}>{intl.getMessage('queries')}</h2>
++                <div class={cn(theme.text.t3, s.legend)}>
++                    <span class={s.legendItem}>
++                        <span class={s.dot} style={{ background: QUERIES_COLOR }} />
++                        {intl.getMessage('dns_queries')}
++                    </span>
++                    <span class={s.legendItem}>
++                        <span class={s.dot} style={{ background: BLOCKED_COLOR }} />
++                        {intl.getMessage('blocked')}
++                    </span>
++                </div>
++            </div>
++            <div class={s.chart}>
++                <canvas ref={setCanvasRef} role="img" aria-label={intl.getMessage('queries')} />
++                <div ref={(element) => (tooltipEl = element)} class={s.tooltip} />
++            </div>
++        </section>
++    );
++};
+diff --git a/client_v2/src/components/Dashboard/blocks/QueriesChart/index.ts b/client_v2/src/components/Dashboard/blocks/QueriesChart/index.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..8a3316922f5254515205deaea9876c503fa52f2f
+--- /dev/null
++++ b/client_v2/src/components/Dashboard/blocks/QueriesChart/index.ts
+@@ -0,0 +1 @@
++export { QueriesChart } from './QueriesChart';
 diff --git a/client_v2/src/components/Dashboard/blocks/StatCard/StatCard.tsx b/client_v2/src/components/Dashboard/blocks/StatCard/StatCard.tsx
 index 81117d33048992840be5f6b46595643767f699df..5dc77495fcfa9a13acaaf178602790871998a9f0 100644
 --- a/client_v2/src/components/Dashboard/blocks/StatCard/StatCard.tsx

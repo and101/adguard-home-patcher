@@ -5,6 +5,7 @@ Adds a few frontend improvements to the official AdGuard Home binary and Docker 
 ## Features
 
 - Dashboard time ranges: adds **Last 1 hour**, **Last 12 hours**, **Today** and a **Custom** number of hours or days to the period menu. Ranges longer than the statistics retention period aren't offered. See the [screenshots](docs/dashboard-desktop.png) ([mobile](docs/dashboard-mobile.png)).
+- A combined **Queries** chart on the dashboard: DNS queries and blocked queries (filters, safe browsing and parental control) overlaid on one time axis, with a tooltip for each hour or day. See the [screenshot](docs/dashboard-chart-desktop.png) ([mobile](docs/dashboard-chart-mobile.png)).
 - Live Query Log with pause, queued arrivals, filters and a browser-only "Clear view". See the [screenshots](docs/live-query-log-controls.md).
 - Updates are manual. Nothing is scheduled on your host.
 - Falls back to the stock dashboard if the installed frontend doesn't match your AdGuard Home version.
