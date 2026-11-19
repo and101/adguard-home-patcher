@@ -260,6 +260,9 @@ async function check(environment) {
         await expect(page.getByTestId('stats-custom-period-error')).toHaveText('Longer than the statistics retention period');
         await noHorizontalOverflow('custom range editor');
         await shot('dashboard-custom-editor');
+        // The editor opens in days when the current range is whole days (e.g. Today late in the day).
+        await custom.getByTestId('stats-custom-period-unit').getByRole('combobox').click();
+        await page.getByRole('option', { name: 'hours', exact: true }).click();
         await value.fill('13');
         await apply.click();
         await expect(custom).toHaveCount(0);

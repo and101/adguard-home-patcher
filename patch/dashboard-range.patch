@@ -1781,7 +1781,7 @@ index 0000000000000000000000000000000000000000..1f3484e65d939e8eaa9c4d94a3768501
 +export { CustomPeriod } from './CustomPeriod';
 diff --git a/client_v2/src/components/Dashboard/blocks/QueriesChart/QueriesChart.module.pcss b/client_v2/src/components/Dashboard/blocks/QueriesChart/QueriesChart.module.pcss
 new file mode 100644
-index 0000000000000000000000000000000000000000..61feafda87f6200c5eb14a515a4b2abccc4006fd
+index 0000000000000000000000000000000000000000..4956b7140a94cfd1aa413965d70631f3d505aa74
 --- /dev/null
 +++ b/client_v2/src/components/Dashboard/blocks/QueriesChart/QueriesChart.module.pcss
 @@ -0,0 +1,96 @@
@@ -1791,9 +1791,9 @@ index 0000000000000000000000000000000000000000..61feafda87f6200c5eb14a515a4b2abc
 +    gap: 12px;
 +    margin: 0 16px 32px;
 +    padding: 16px;
++    /* Border only, like the other dashboard cards. */
 +    border: 1px solid var(--default-item-divider);
 +    border-radius: 8px;
-+    background: var(--default-cards-background);
 +
 +    @media (min-width: 1024px) {
 +        gap: 16px;
@@ -1883,10 +1883,10 @@ index 0000000000000000000000000000000000000000..61feafda87f6200c5eb14a515a4b2abc
 +}
 diff --git a/client_v2/src/components/Dashboard/blocks/QueriesChart/QueriesChart.tsx b/client_v2/src/components/Dashboard/blocks/QueriesChart/QueriesChart.tsx
 new file mode 100644
-index 0000000000000000000000000000000000000000..aa4cb2977cedf556713e3ea6d8f785c880632470
+index 0000000000000000000000000000000000000000..fed3833ae0e9fdbafd7daca2f2b73add7a041f0c
 --- /dev/null
 +++ b/client_v2/src/components/Dashboard/blocks/QueriesChart/QueriesChart.tsx
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,196 @@
 +import { createMemo, onCleanup, onMount, untrack } from 'solid-js';
 +import cn from 'clsx';
 +import {
@@ -1967,8 +1967,9 @@ index 0000000000000000000000000000000000000000..aa4cb2977cedf556713e3ea6d8f785c8
 +const gradient = (color: string) => (context: ScriptableContext<'line'>) => {
 +    const { ctx, height } = context.chart;
 +    const fill = ctx.createLinearGradient(0, 0, 0, height || 200);
-+    fill.addColorStop(0, `${color}66`);
-+    fill.addColorStop(1, `${color}0D`);
++    // The same fade as the stat card charts.
++    fill.addColorStop(0, `${color}4D`);
++    fill.addColorStop(1, `${color}00`);
 +    return fill;
 +};
 +
