@@ -21,7 +21,8 @@ async function waitFor(label, check, timeout = 30000) {
     throw new Error(`${label} not ready within ${timeout}ms: ${last?.message}`, { cause: last });
 }
 
-async function withOfficialServer(source, binary, tag, test) {
+// configure, if given, may adjust the disposable configuration before the binary starts.
+async function withOfficialServer(source, binary, tag, test, configure = () => {}) {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'agh-real-querylog-'));
     const cleanup = [];
     let cleaning;
@@ -106,6 +107,7 @@ async function withOfficialServer(source, binary, tag, test) {
             statistics: { enabled: true, interval: '24h' },
             dhcp: { enabled: false }, tls: { enabled: false },
         };
+        configure(config);
         await fs.writeFile(path.join(directory, 'AdGuardHome.yaml'), JSON.stringify(config), { mode: 0o600 });
         await fs.cp(path.join(source, 'build/static'), path.join(directory, 'build/static'), { recursive: true });
         // Release only our reservations immediately before the binary binds the same ports.
@@ -201,12 +203,15 @@ async function withOfficialServer(source, binary, tag, test) {
 }
 
 async function loadProductionRecovery(source, directory) {
-    const upstreamRequire = createRequire(path.join(source, 'client/package.json'));
+    const client = path.join(source, 'client_v2');
+    const upstreamRequire = createRequire(path.join(client, 'package.json'));
     const { outputFiles } = await upstreamRequire('esbuild').build({
-        stdin: { contents: `export * from './src/helpers/liveQueryLogRecovery';
-            export { compareTimes, identifyLiveLogs } from './src/helpers/liveQueryLog';
-            export { normalizeLogs } from './src/helpers/helpers';`, resolveDir: path.join(source, 'client') },
-        bundle: true, platform: 'node', format: 'cjs', write: false,
+        stdin: { contents: `export * from 'panel/helpers/liveQueryLogRecovery';
+            export { compareTimes, identifyLiveLogs } from 'panel/helpers/liveQueryLog';
+            export { normalizeLogs } from 'panel/helpers/helpers';`, resolveDir: client },
+        alias: { panel: path.join(client, 'src') },
+        jsx: 'automatic', jsxImportSource: 'solid-js/h',
+        bundle: true, platform: 'node', format: 'cjs', write: false, logLevel: 'error',
     });
     const compiled = path.join(directory, 'production-recovery.cjs');
     await fs.writeFile(compiled, outputFiles[0].contents);

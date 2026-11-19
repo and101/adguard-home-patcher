@@ -1,10 +1,10 @@
 # Live Query Log controls
 
-Click **Start Live View** to start polling. The button turns into **Pause Live View**, and a **Clear view** button appears next to it. Clear view only empties the table in your browser; the server's Query Log isn't touched.
+Live View sits below the Query Log filters. Click **Start Live View** to start polling. The button turns into **Pause Live View**, a status indicator shows the sync state, and a **Clear view** button appears. Clear view only empties the list in your browser; the server's Query Log isn't touched. While Live View is on, the list shows the newest entries only; pause it to scroll into older history.
 
-If you've scrolled down to older rows, new queries are held back behind a "17 new queries — Show newest" bar. Clicking it shows them and jumps back to the top.
+If you've scrolled down to older rows, new queries are held back behind a "2 new queries — Show newest" button. Clicking it shows them and jumps back to the top; scrolling back to the top does the same.
 
-The screenshots below were taken from the production build using the browser test harness with fixed sample data (blocked queries for `google.com`). Desktop is 1440×900 and mobile 390×844; the tests also cover 320×740.
+The screenshots below were taken by the browser test (`scripts/tests/ui-browser.cjs`) running the production build against the official AdGuard Home v1.0.0 binary, with generated sample queries answered by a local DNS rewrite. Desktop is 1280×900 and mobile 390×844.
 
 ## How live polling works
 
@@ -24,16 +24,16 @@ The table keeps at most 500 displayed rows and 500 queued rows.
 - **Catching up:** starting, resuming or fetching extra pages.
 - **Reconnecting:** requests are failing or the browser is offline.
 - **Suspended:** the tab is hidden.
-- **Gap detected:** continuity couldn't be confirmed. Shown alongside the other states.
+- **Gap detected:** continuity couldn't be confirmed. Shown as a warning line below the controls, alongside the other states.
 - **Paused:** Live View is off. Normal history paging still works.
 
-The indicator is an ARIA live region, so screen readers announce changes.
+The status text is an ARIA live region, so screen readers announce changes; the gap warning is announced as an alert.
 
 **Clear view** cancels the current poll, removes the rows from the table and hides anything at or older than the newest entry already seen. It never calls the server's clear endpoint.
 
 ## What can still be missed
 
-AdGuard Home's [Query Log API](https://github.com/AdguardTeam/AdGuardHome/blob/v0.107.79/openapi/openapi.yaml#L190-L255) has no unique event ID or snapshot token, so the browser can't *prove* it saw every event; it can only check overlap. In normal operation the late window closes the known holes, and the release build tests this by polling continuously against the official binary while it repeatedly flushes its buffer to disk.
+AdGuard Home's [Query Log API](https://github.com/AdguardTeam/AdGuardHome/blob/v1.0.0/openapi/openapi.yaml) has no unique event ID or snapshot token, so the browser can't *prove* it saw every event; it can only check overlap. In normal operation the late window closes the known holes, and the release build tests this by polling continuously against the official binary while it repeatedly flushes its buffer to disk.
 
 These cases still can't be recovered, and show a gap warning when they're detectable:
 
@@ -60,8 +60,8 @@ Everything here lives in the frontend patch. The AdGuard Home binary, DNS handli
 
 ## Mobile, live
 
-<img src="query-log-mobile-390-live.png" alt="Mobile Query Log with Pause Live View and Clear view on one row" width="390">
+<img src="query-log-mobile-390-live.png" alt="Mobile Query Log with Pause Live View, the Live / Synced status and Clear view" width="390">
 
 ## Mobile, queued queries
 
-<img src="query-log-mobile-390-pending.png" alt="Mobile Query Log scrolled down with a bar showing 17 new queries" width="390">
+<img src="query-log-mobile-390-pending.png" alt="Mobile Query Log scrolled down with a button showing 2 new queries" width="390">

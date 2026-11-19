@@ -7,17 +7,17 @@ This repository holds the patch and the build/release tooling. End users should 
 You need Node.js 22, Python 3.9+, Git, curl and tar. Browser checks use Playwright's Chromium.
 
 ```sh
-BROWSER_TEST=1 scripts/build-release.sh v0.107.79 dist
+BROWSER_TEST=1 scripts/build-release.sh v1.0.0 dist
 ```
 
-The patch is written against the tag in `patch/PATCH_BASE` and applied to newer tags with a three-way merge. The build script runs, in order:
+The patch targets the v1 web interface in `client_v2/` (a SolidJS app) and is written against the tag in `patch/PATCH_BASE`; newer tags get a three-way merge. Upstream sources still contain the legacy `client/` tree, which v1 releases don't ship, so the build refuses a tag whose shipped interface (`client/` up to v0.107, `client_v2/` from v1.0.0) isn't the one the patch targets. The build script runs, in order:
 
 1. The Python test suites (validation, installer/updater, bootstrap).
 2. Patch application, plus a whitespace check on the applied source.
 3. Type checking, lint and the frontend unit tests.
 4. A production build.
-5. Browser tests for the Live Query Log (only with `BROWSER_TEST=1`).
-6. An integration test against the official AdGuard Home binary (skip with `SMOKE_TEST=0`).
+5. An integration test against the official AdGuard Home binary (skip with `SMOKE_TEST=0`).
+6. Browser tests of the patched UI against that binary (only with `BROWSER_TEST=1`; they need the binary, so not with `SMOKE_TEST=0`).
 
 If everything passes, `dist/` gets three archives, each with a `.sha256` file:
 
@@ -42,6 +42,8 @@ The test sends a few thousand real DNS queries and checks that:
 - no records are modified by the process.
 
 With `BROWSER_TEST=1` the same server is also driven from the production UI in Chromium. The browser's network guard blocks external origins and the server's "clear log" endpoint.
+
+`scripts/tests/ui-browser.cjs` then starts a fresh official instance (statistics kept for seven days) and drives the production UI at 1280×900 and 390×844: starting and pausing Live View and its persistence across reloads, live arrivals, queued arrivals and **Show newest**, no history paging while live, **Clear view**, suspension in a hidden tab, retry after injected request failures with one error toast, the combined Queries chart and its tooltip, and the dashboard's 1 hour, Today and Custom ranges (including the `recent` value sent to the stats API and input validation). It also checks for horizontal scrolling and browser errors. Pass a directory as the fourth argument to save screenshots.
 
 Some things can't be tested this way: exact nanosecond timestamp ties can't be forced through the real binary (unit tests cover them), and AdGuard Home's file scan stops after 50,000 candidates, so sparse filters can return empty pages with a continuation cursor. See [what can still be missed](live-query-log-controls.md#what-can-still-be-missed).
 

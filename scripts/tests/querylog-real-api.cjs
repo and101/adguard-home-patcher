@@ -9,6 +9,14 @@ const { withOfficialServer, loadProductionRecovery, waitFor } = require('./query
 const source = path.resolve(process.argv[2]);
 const binary = path.resolve(process.argv[3]);
 const tag = process.argv[4];
+const clientPackage = path.join(source, 'client_v2/package.json');
+// The v1 web interface filters by status with these reasons (STATUS_TO_REASONS in
+// client_v2/src/stores/queryLogs.ts); the Live poller sends the same parameters.
+const STATUS_REASONS = {
+    all: [],
+    blocked: ['FilteredBlackList', 'FilteredSafeBrowsing', 'FilteredParental', 'FilteredBlockedService'],
+    rewritten: ['Rewrite', 'RewriteEtcHosts', 'RewriteRule', 'FilteredSafeSearch'],
+};
 
 async function check(environment) {
     const { base, marker, request, sendQueries, directory } = environment;
@@ -28,7 +36,8 @@ async function check(environment) {
         }
     };
     const queryPage = async (search, olderThan, signal, responseStatus = 'all') => {
-        const params = new URLSearchParams({ limit: '100', search, response_status: responseStatus });
+        const params = new URLSearchParams({ limit: '100', search });
+        STATUS_REASONS[responseStatus].forEach(reason => params.append('reason', reason));
         if (olderThan !== undefined) params.set('older_than', olderThan);
         assert.equal(params.has('offset'), false);
         const response = await (await request(`/control/querylog?${params}`, { signal })).json();
@@ -127,7 +136,7 @@ async function check(environment) {
     const uiErrors = [];
     try {
         if (process.env.BROWSER_TEST === '1') {
-            const upstreamRequire = createRequire(path.join(source, 'client/package.json'));
+            const upstreamRequire = createRequire(clientPackage);
             const { chromium, expect } = upstreamRequire('@playwright/test');
             browser = await chromium.launch({
                 executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined,
@@ -158,14 +167,14 @@ async function check(environment) {
                 const url = new URL(request.url());
 
                 if (url.pathname === '/control/querylog' && url.searchParams.get('limit') === '100') {
-                    if (url.searchParams.get('search') !== marker
-                        || url.searchParams.get('response_status') !== 'all' || url.searchParams.has('offset')) {
+                    if (url.searchParams.get('search') !== marker || url.searchParams.has('reason')
+                        || url.searchParams.has('response_status') || url.searchParams.has('offset')) {
                         uiViolations.push(url.href);
                     }
                     uiRequests.push(url.searchParams.get('older_than'));
                 }
             });
-            await page.goto(`${base}/#logs?search=${marker}&response_status=all`);
+            await page.goto(`${base}/#/logs?search=${marker}`);
             await page.bringToFront();
             await expect(page.getByRole('button', { name: 'Start Live View', exact: true })).toBeVisible();
             await page.waitForLoadState('networkidle');
@@ -173,7 +182,7 @@ async function check(environment) {
             await page.clock.pauseAt(new Date(Date.now() + 100));
             await page.getByRole('button', { name: 'Start Live View', exact: true }).press('Enter');
             await page.clock.runFor(1000);
-            syncStatus = page.locator('.logs__sync-status[role="status"]');
+            syncStatus = page.getByTestId('query-log-live-status');
             await expect(syncStatus).toHaveText('Live / Synced');
             assert.equal(uiRequests.length, 1);
         }
@@ -236,11 +245,11 @@ async function check(environment) {
         console.log('Reduced recovery budget: exactly 2 pages / 200 rows -> page-budget gap -> 1-page rebase');
 
         if (page) {
-            const { expect } = createRequire(path.join(source, 'client/package.json'))('@playwright/test');
+            const { expect } = createRequire(clientPackage)('@playwright/test');
             const start = uiRequests.length;
             await page.clock.runFor(1000);
             await expect(syncStatus).toHaveText('Live / Synced');
-            await expect(page.getByTestId('querylog_cell')).toHaveCount(252);
+            await expect(page.getByTestId('query-log-actions-cell')).toHaveCount(252);
             assert.equal(uiRequests.length - start, 4);
         }
 
@@ -260,12 +269,14 @@ async function check(environment) {
         assert.ok(next.calls.length <= windowPages, `Rebased polling read ${next.calls.length} pages`);
         assert.equal(next.result.gap, false, 'New overlap is observable; prior gap remains a lifecycle/UI warning');
         if (page) {
-            const { expect } = createRequire(path.join(source, 'client/package.json'))('@playwright/test');
+            const { expect } = createRequire(clientPackage)('@playwright/test');
             const start = uiRequests.length;
             await page.clock.runFor(1000);
-            await expect(syncStatus).toContainText('Gap detected');
+            await expect(syncStatus).toHaveAttribute('data-status', 'gap');
+            await expect(page.getByTestId('query-log-live-gap')).toHaveText(
+                'Gap detected — some queries may not have been recovered.');
             assert.equal(uiRequests.length - start, LIVE_LOG_RECOVERY_MAX_PAGES);
-            await expect(page.getByTestId('querylog_cell')).toHaveCount(500);
+            await expect(page.getByTestId('query-log-actions-cell')).toHaveCount(500);
             const rebaseStart = uiRequests.length;
             const rebaseResponse = page.waitForResponse(response => {
                 const url = new URL(response.url());
@@ -281,7 +292,7 @@ async function check(environment) {
             const response = await rebaseResponse;
             assert.equal(response.status(), 200, 'Rebased UI poll must succeed');
             assert.equal(await response.finished(), null, 'Rebased UI response must finish successfully');
-            await expect(syncStatus).toHaveText('Gap detected — some queries may not have been recovered.');
+            await expect(syncStatus).toHaveAttribute('data-status', 'gap');
             const rebaseRequests = uiRequests.length - rebaseStart;
             assert.ok(rebaseRequests >= 1 && rebaseRequests <= windowPages,
                 `Completed rebased UI cycle must not repeat the backfill (${rebaseRequests} requests)`);
