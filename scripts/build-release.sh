@@ -13,10 +13,12 @@
 #   agh-dashboard-range-source.tar.gz.sha256
 # On failure, it exits non-zero and writes the reason to out-dir/REASON.
 #
-# Gate: the stats API still documents "recent", the patch applies (three-way
-# against PATCH_BASE), applied-source whitespace, typecheck, eslint, unit tests,
-# production build, and a real-DNS/Query Log integration test using the official
-# release binary with the patched UI. Set SMOKE_TEST=0 to skip binary checks.
+# Gate: the release ships the web interface the patch targets, the stats API
+# still documents "recent", the patch applies (three-way against PATCH_BASE),
+# applied-source whitespace, typecheck, eslint, unit tests, production build,
+# and a real-DNS/Query Log integration test using the official release binary
+# with the patched UI.  With BROWSER_TEST=1 the patched UI is also driven in
+# Chromium against that binary.  Set SMOKE_TEST=0 to skip binary checks.
 #
 # The UI manifest's patch_revision is the SHA-256 artefact revision of the built
 # build/static files.  Webpack's CSS names include a compilation hash that
@@ -82,6 +84,9 @@ smoke_test() {
 		"https://github.com/AdguardTeam/AdGuardHome/releases/download/$tag/AdGuardHome_linux_$arch.tar.gz"
 	tar xzf "$dir/agh.tgz" -C "$dir"
 	node "$repo_root/scripts/tests/querylog-real-api.cjs" "$src" "$dir/AdGuardHome/AdGuardHome" "$tag"
+	if [ "$BROWSER_TEST" = 1 ]; then
+		node "$repo_root/scripts/tests/ui-browser.cjs" "$src" "$dir/AdGuardHome/AdGuardHome" "$tag"
+	fi
 }
 
 rm -f "$out/REASON" "$out"/agh-dashboard-range.tar.gz* "$out"/agh-dashboard-range-source.tar.gz* "$out"/agh-patcher-tools.tar.gz*
@@ -125,9 +130,9 @@ fi
 # --3way stages the applied patch; checking only the working diff misses it.
 step "applied-source whitespace" "$repo_root/scripts/check-applied-whitespace.sh" "$src"
 
-mapfile -t ts_files < <(grep '^+++ b/client/' "$patch_file" | sed 's#^+++ b/client/##' | grep -E '\.tsx?$')
+mapfile -t ts_files < <(grep "^+++ b/$patch_client/" "$patch_file" | sed "s#^+++ b/$patch_client/##" | grep -E '\.tsx?$')
 
-cd "$src/client"
+cd "$src/$patch_client"
 step "npm ci" npm ci --no-audit --no-fund
 step "typecheck" npm run typecheck
 step "lint" npx eslint --ext .ts,.tsx "${ts_files[@]}"
@@ -135,15 +140,14 @@ step "unit tests" npx vitest --run
 step "production build" sh "$repo_root/scripts/frontend-build.sh"
 [ -f "$src/build/static/index.html" ] || fail "build produced no index.html"
 
-if [ "$BROWSER_TEST" = 1 ]; then
-	if [ -z "${PLAYWRIGHT_CHROMIUM_EXECUTABLE:-}" ]; then
-		step "install Chromium for browser checks" npx playwright install --with-deps chromium --only-shell
-	fi
-	step "Live Query Log browser checks" node "$repo_root/scripts/tests/live-query-log-browser.cjs" "$src"
+if [ "$BROWSER_TEST" = 1 ] && [ -z "${PLAYWRIGHT_CHROMIUM_EXECUTABLE:-}" ]; then
+	step "install Chromium for browser checks" npx playwright install --with-deps chromium --only-shell
 fi
 
 if [ "$SMOKE_TEST" = 1 ]; then
 	step "smoke test against the official $tag binary" smoke_test
+elif [ "$BROWSER_TEST" = 1 ]; then
+	fail "browser checks need the official binary; unset SMOKE_TEST=0"
 fi
 
 echo "$tag" >"$src/build/VERSION"
@@ -164,7 +168,7 @@ cp "$repo_root"/docs/*.md "$src/patcher/docs/"
 mkdir -p "$src/patcher/.github/workflows"
 cp "$repo_root/.github/workflows/build.yml" "$src/patcher/.github/workflows/"
 tar czf "$out/agh-dashboard-range-source.tar.gz" \
-	--exclude='./.git' --exclude='./client/node_modules' --exclude='./build' \
+	--exclude='./.git' --exclude='./client/node_modules' --exclude='./client_v2/node_modules' --exclude='./build' \
 	--exclude='*/__pycache__' --exclude='*.pyc' -C "$src" .
 (cd "$out" && sha256sum agh-dashboard-range-source.tar.gz >agh-dashboard-range-source.tar.gz.sha256)
 step "release manifest and packaged management tooling" python3 "$repo_root/scripts/release-manifest.py" --verify "$tag" "$out"

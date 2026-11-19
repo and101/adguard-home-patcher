@@ -4,14 +4,14 @@ Adds a few frontend improvements to the official AdGuard Home binary and Docker 
 
 ## Features
 
-- Dashboard time ranges: last few hours, today, last N days or a custom range.
+- Dashboard time ranges: adds **Last 1 hour**, **Last 12 hours**, **Today** and a **Custom** number of hours or days to the period menu. Ranges longer than the statistics retention period aren't offered. See the [screenshots](docs/dashboard-desktop.png) ([mobile](docs/dashboard-mobile.png)).
 - Live Query Log with pause, queued arrivals, filters and a browser-only "Clear view". See the [screenshots](docs/live-query-log-controls.md).
 - Updates are manual. Nothing is scheduled on your host.
 - Falls back to the stock dashboard if the installed frontend doesn't match your AdGuard Home version.
 
 ## Requirements
 
-- An existing AdGuard Home installation on Linux.
+- An existing AdGuard Home v1.0.0 or later installation on Linux. Releases are built for the new v1 web interface; the existing `ui-v0.107.x` releases keep working for v0.107 installs but no longer get updates.
 - Python 3.9+, curl, CA certificates, tar and `sha256sum`.
 - Native installs: the `AdGuardHome.service` systemd unit.
 - Docker installs: the official `adguard/adguardhome` image and Docker Compose.
@@ -53,7 +53,7 @@ The patcher owns `compose.patcher.yaml`; your base Compose file and volumes stay
 If you'd rather not pipe a script, set `AGH_VERSION` to your installed version (with the `v`) and fetch the tools yourself:
 
 ```sh
-AGH_VERSION=v0.107.79
+AGH_VERSION=v1.0.0
 (
   set -eu
   printf '%s\n' "$AGH_VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9]+([.-][A-Za-z0-9]+)*)?$'
