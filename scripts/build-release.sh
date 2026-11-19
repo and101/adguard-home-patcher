@@ -97,6 +97,17 @@ step "manual patcher install/update/uninstall tests" python3 "$repo_root/scripts
 log "building $tag with patch made against $patch_base"
 git clone -q --depth 1 --branch "$tag" "$REPO_URL" "$src" || fail "couldn't fetch the $tag source"
 
+# Upstream ships the legacy client/ UI up to v0.107.x and client_v2/ from v1.0.0.
+# Both trees exist in the source, so a patch for the wrong one still applies and
+# would replace the shipped UI with a different one.
+case "$tag" in
+v0.*) shipped_client=client ;;
+*) shipped_client=client_v2 ;;
+esac
+patch_client=$(sed -n '0,/^+++ b\//s#^+++ b/\([^/]*\)/.*#\1#p' "$patch_file")
+[ "$patch_client" = "$shipped_client" ] \
+	|| fail "the patch targets $patch_client/ but $tag ships the $shipped_client/ web interface"
+
 grep -q "'name': 'recent'" "$src/openapi/openapi.yaml" \
 	|| fail "the stats API no longer documents the 'recent' parameter"
 
